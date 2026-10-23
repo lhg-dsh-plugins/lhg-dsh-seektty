@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'codex/**', 'release/**']
+  pull_request:
+
+jobs:
+  check:
+    name: pnpm run check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck, test, build, and pack-check
+        run: pnpm run check
+
+      - name: Keep committed lib/ in sync with source
+        run: |
+          git diff --exit-code lib/
+          test -z "$(git status --porcelain -- lib/)"
+
+      - name: Pack and boot without workspace dev dependencies
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          node scripts/install-stock-dsh.mjs "$RUNNER_TEMP/dsh-global"
+          pnpm pack --pack-destination "$RUNNER_TEMP"
+          DSH_BIN="$RUNNER_TEMP/dsh-global/node_modules/.bin/dsh" \
+          SEEKTTY_SPEC="$RUNNER_TEMP/seektty-$VERSION.tgz" \
+          node scripts/stock-dsh-cycle.mjs
+
+      - name: Build the shared pnpm-layout candidate
+        run: |
+          mkdir -p .artifacts
+          pnpm pack --pack-destination .artifacts
+
+      - name: Upload the shared candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: seektty-candidate
+          path: .artifacts/seektty-*.tgz
+          include-hidden-files: true
+          if-no-files-found: error
+
+  pnpm11-layout:
+    name: pnpm 11 layouts · ${{ matrix.os }} · Node ${{ matrix.node }}
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [22.x, 24.x]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: 'pnpm'
+
+      - name: Install acceptance dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download the shared candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: seektty-candidate
+          path: .artifacts
+
+      - name: GVS disabled · full official dsh lifecycle
+        run: pnpm test:pnpm11-layout false .artifacts
+
+      - name: GVS enabled · positive boot or exact known-failure diagnosis
+        run: pnpm test:pnpm11-layout true .artifacts
+
+  launcher-windows:
+    name: Windows launcher
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Launcher and package contract tests
+        run: pnpm exec vitest run tests/launcher.test.ts tests/package-contract.test.ts
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Launcher --version smoke
+        run: node ./lib/bin.js --version

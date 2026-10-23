@@ -1,0 +1,2520 @@
+diff --git a/dist/components/editor.d.ts b/dist/components/editor.d.ts
+index fb224b9da697aab89a31336eae65071dc07d736e..49afe6c1c0769e856eb2a2ce10e49fd391c1d2af 100644
+--- a/dist/components/editor.d.ts
++++ b/dist/components/editor.d.ts
+@@ -30,6 +30,20 @@ export interface EditorOptions {
+     paddingX?: number;
+     autocompleteMaxVisible?: number;
+ }
++export interface AutocompleteSnapshot {
++    generation: number;
++    selectedIndex: number;
++    visibleRows: ReadonlyArray<{
++        visualRow: number;
++        absoluteIndex: number;
++        itemId: string;
++        selectable: boolean;
++    }>;
++}
++export interface AutocompleteActivation {
++    applied: boolean;
++    submitText?: string;
++}
+ export declare class Editor implements Component, Focusable {
+     private state;
+     /** Focusable interface - set by TUI when focus changes */
+@@ -50,6 +64,9 @@ export declare class Editor implements Component, Focusable {
+     private autocompleteRequestTask;
+     private autocompleteStartToken;
+     private autocompleteRequestId;
++    private autocompleteGeneration;
++    private autocompleteItemIds;
++    private autocompleteRenderSnapshot;
+     private pastes;
+     private pasteCounter;
+     private pasteBuffer;
+@@ -102,7 +119,39 @@ export declare class Editor implements Component, Focusable {
+         line: number;
+         col: number;
+     };
+-    setText(text: string): void;
++    setCursor(line: number, col: number): void;
++    getSelection(): {
++        anchor: {
++            line: number;
++            col: number;
++        };
++        focus: {
++            line: number;
++            col: number;
++        };
++    } | undefined;
++    setSelection(anchor: {
++        line: number;
++        col: number;
++    }, focus: {
++        line: number;
++        col: number;
++    }): void;
++    clearSelection(): void;
++    replaceSelection(text: string): boolean;
++    getVisualLineMap(width?: number): {
++        logicalLine: number;
++        startCol: number;
++        length: number;
++    }[];
++    getAutocompleteSnapshot(): AutocompleteSnapshot | undefined;
++    moveAutocompleteSelection(delta: number): boolean;
++    scrollAutocomplete(delta: number): boolean;
++    selectAutocompleteItem(generation: number, itemId: string): boolean;
++    completeAutocompleteSelection(): boolean;
++    activateAutocompleteSelection(source: "enter" | "mouse"): AutocompleteActivation;
++    private applyAutocompleteSelection;
++    setText(text: string, options?: { recordUndo?: boolean }): void;
+     /**
+      * Insert text at the current cursor position.
+      * Used for programmatic insertion (e.g., clipboard image markers).
+@@ -125,6 +174,7 @@ export declare class Editor implements Component, Focusable {
+     private handlePaste;
+     private addNewLine;
+     private shouldSubmitOnBackslashEnter;
++    private consumeSubmitValue;
+     private submitValue;
+     private handleBackspace;
+     /**
+diff --git a/dist/components/editor.js b/dist/components/editor.js
+index 50f92259fa88f4efe406a60b7db8e54a9eedace6..e9749bd069e0fef9ebaa2e5ef2c893e53d4c2953 100644
+--- a/dist/components/editor.js
++++ b/dist/components/editor.js
+@@ -171,6 +171,7 @@ export class Editor {
+     lastWidth = 80;
+     // Vertical scrolling support
+     scrollOffset = 0;
++    visibleLineMap = [];
+     // Border color (can be changed dynamically)
+     borderColor;
+     // Autocomplete support
+@@ -184,6 +185,9 @@ export class Editor {
+     autocompleteRequestTask = Promise.resolve();
+     autocompleteStartToken = 0;
+     autocompleteRequestId = 0;
++    autocompleteGeneration = 0;
++    autocompleteItemIds = [];
++    autocompleteRenderSnapshot = null;
+     // Paste tracking for large pastes
+     pastes = new Map();
+     pasteCounter = 0;
+@@ -208,6 +212,7 @@ export class Editor {
+     snappedFromCursorCol = null;
+     // Undo support
+     undoStack = new UndoStack();
++    selectionRange = null;
+     onSubmit;
+     onChange;
+     disableSubmit = false;
+@@ -308,6 +313,7 @@ export class Editor {
+         this.state.lines = lines.length === 0 ? [""] : lines;
+         this.state.cursorLine = this.state.lines.length - 1;
+         this.setCursorCol(this.state.lines[this.state.cursorLine]?.length || 0);
++        this.selectionRange = null;
+         // Reset scroll - render() will adjust to show cursor
+         this.scrollOffset = 0;
+         if (this.onChange) {
+@@ -348,6 +354,10 @@ export class Editor {
+         this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, maxScrollOffset));
+         // Get visible lines slice
+         const visibleLines = layoutLines.slice(this.scrollOffset, this.scrollOffset + maxVisibleLines);
++        this.visibleLineMap = visibleLines.map((line, index) => ({
++            row: index + 1, col: paddingX, logicalLine: line.logicalLine,
++            startCol: line.startCol, text: line.text,
++        }));
+         const result = [];
+         const leftPadding = " ".repeat(paddingX);
+         const rightPadding = leftPadding;
+@@ -372,10 +382,33 @@ export class Editor {
+             let displayText = layoutLine.text;
+             let lineVisibleWidth = visibleWidth(layoutLine.text);
+             let cursorInPadding = false;
++            const selection = this.normalizedSelection();
++            let selectionStart = -1;
++            let selectionEnd = -1;
++            if (selection && layoutLine.logicalLine >= selection.start.line && layoutLine.logicalLine <= selection.end.line) {
++                selectionStart = layoutLine.logicalLine === selection.start.line
++                    ? Math.max(0, selection.start.col - layoutLine.startCol)
++                    : 0;
++                selectionEnd = layoutLine.logicalLine === selection.end.line
++                    ? Math.min(displayText.length, selection.end.col - layoutLine.startCol)
++                    : displayText.length;
++                selectionStart = Math.min(displayText.length, selectionStart);
++                if (selectionEnd > selectionStart) {
++                    displayText = displayText.slice(0, selectionStart) + "\x1b[7m" +
++                        displayText.slice(selectionStart, selectionEnd) + "\x1b[27m" +
++                        displayText.slice(selectionEnd);
++                }
++            }
+             // Add cursor if this line has it
+             if (layoutLine.hasCursor && layoutLine.cursorPos !== undefined) {
+-                const before = displayText.slice(0, layoutLine.cursorPos);
+-                const after = displayText.slice(layoutLine.cursorPos);
++                let cursorPos = layoutLine.cursorPos;
++                const cursorInsideSelection = selectionEnd > selectionStart &&
++                    cursorPos >= selectionStart && cursorPos < selectionEnd;
++                if (selectionEnd > selectionStart && cursorPos >= selectionStart) {
++                    cursorPos += cursorPos >= selectionEnd ? 9 : 4;
++                }
++                const before = displayText.slice(0, cursorPos);
++                const after = displayText.slice(cursorPos);
+                 // Hardware cursor marker (zero-width, emitted before fake cursor for IME positioning)
+                 const marker = emitCursorMarker ? CURSOR_MARKER : "";
+                 if (after.length > 0) {
+@@ -384,7 +417,7 @@ export class Editor {
+                     const afterGraphemes = [...this.segment(after)];
+                     const firstGrapheme = afterGraphemes[0]?.segment || "";
+                     const restAfter = after.slice(firstGrapheme.length);
+-                    const cursor = `\x1b[7m${firstGrapheme}\x1b[0m`;
++                    const cursor = `\x1b[7m${firstGrapheme}\x1b[0m${cursorInsideSelection ? "\x1b[7m" : ""}`;
+                     displayText = before + marker + cursor + restAfter;
+                     // lineVisibleWidth stays the same - we're replacing, not adding
+                 }
+@@ -423,6 +456,22 @@ export class Editor {
+                 const linePadding = " ".repeat(Math.max(0, contentWidth - lineWidth));
+                 result.push(`${leftPadding}${line}${linePadding}${rightPadding}`);
+             }
++            const listSnapshot = this.autocompleteList.getRenderSnapshot?.();
++            this.autocompleteRenderSnapshot = listSnapshot
++                ? {
++                    generation: this.autocompleteGeneration,
++                    selectedIndex: listSnapshot.selectedIndex,
++                    visibleRows: listSnapshot.visibleRows.map((row) => ({
++                        visualRow: row.visualRow,
++                        absoluteIndex: row.absoluteIndex,
++                        itemId: this.autocompleteItemIds[row.absoluteIndex] ?? "",
++                        selectable: this.autocompleteItemIds[row.absoluteIndex] !== undefined,
++                    })),
++                }
++                : null;
++        }
++        else {
++            this.autocompleteRenderSnapshot = null;
+         }
+         return result;
+     }
+@@ -474,6 +523,11 @@ export class Editor {
+         if (kb.matches(data, "tui.input.copy")) {
+             return;
+         }
++        // Escape explicitly clears a persistent mouse selection when no popup owns it.
++        if (!this.autocompleteState && this.normalizedSelection() && kb.matches(data, "tui.select.cancel")) {
++            this.clearSelection();
++            return;
++        }
+         // Undo
+         if (kb.matches(data, "tui.editor.undo")) {
+             this.undo();
+@@ -486,44 +540,18 @@ export class Editor {
+                 return;
+             }
+             if (kb.matches(data, "tui.select.up") || kb.matches(data, "tui.select.down")) {
+-                this.autocompleteList.handleInput(data);
++                this.moveAutocompleteSelection(kb.matches(data, "tui.select.up") ? -1 : 1);
+                 return;
+             }
+             if (kb.matches(data, "tui.input.tab")) {
+-                const selected = this.autocompleteList.getSelectedItem();
+-                if (selected && this.autocompleteProvider) {
+-                    this.pushUndoSnapshot();
+-                    this.lastAction = null;
+-                    const result = this.autocompleteProvider.applyCompletion(this.state.lines, this.state.cursorLine, this.state.cursorCol, selected, this.autocompletePrefix);
+-                    this.state.lines = result.lines;
+-                    this.state.cursorLine = result.cursorLine;
+-                    this.setCursorCol(result.cursorCol);
+-                    this.cancelAutocomplete();
+-                    if (this.onChange)
+-                        this.onChange(this.getText());
+-                }
++                this.completeAutocompleteSelection();
+                 return;
+             }
+             if (kb.matches(data, "tui.select.confirm")) {
+-                const selected = this.autocompleteList.getSelectedItem();
+-                if (selected && this.autocompleteProvider) {
+-                    this.pushUndoSnapshot();
+-                    this.lastAction = null;
+-                    const result = this.autocompleteProvider.applyCompletion(this.state.lines, this.state.cursorLine, this.state.cursorCol, selected, this.autocompletePrefix);
+-                    this.state.lines = result.lines;
+-                    this.state.cursorLine = result.cursorLine;
+-                    this.setCursorCol(result.cursorCol);
+-                    if (this.autocompletePrefix.startsWith("/")) {
+-                        this.cancelAutocomplete();
+-                        // Fall through to submit
+-                    }
+-                    else {
+-                        this.cancelAutocomplete();
+-                        if (this.onChange)
+-                            this.onChange(this.getText());
+-                        return;
+-                    }
+-                }
++                const activation = this.activateAutocompleteSelection("enter");
++                if (activation.submitText !== undefined && this.onSubmit)
++                    this.onSubmit(activation.submitText);
++                return;
+             }
+         }
+         // Tab - trigger completion
+@@ -691,6 +719,8 @@ export class Editor {
+                 text: "",
+                 hasCursor: true,
+                 cursorPos: 0,
++                logicalLine: 0,
++                startCol: 0,
+             });
+             return layoutLines;
+         }
+@@ -706,12 +736,16 @@ export class Editor {
+                         text: line,
+                         hasCursor: true,
+                         cursorPos: this.state.cursorCol,
++                        logicalLine: i,
++                        startCol: 0,
+                     });
+                 }
+                 else {
+                     layoutLines.push({
+                         text: line,
+                         hasCursor: false,
++                        logicalLine: i,
++                        startCol: 0,
+                     });
+                 }
+             }
+@@ -753,12 +787,16 @@ export class Editor {
+                             text: chunk.text,
+                             hasCursor: true,
+                             cursorPos: adjustedCursorPos,
++                            logicalLine: i,
++                            startCol: chunk.startIndex,
+                         });
+                     }
+                     else {
+                         layoutLines.push({
+                             text: chunk.text,
+                             hasCursor: false,
++                            logicalLine: i,
++                            startCol: chunk.startIndex,
+                         });
+                     }
+                 }
+@@ -790,13 +828,154 @@ export class Editor {
+     getCursor() {
+         return { line: this.state.cursorLine, col: this.state.cursorCol };
+     }
+-    setText(text) {
++    setCursor(line, col) {
++        const lineCount = this.state.lines.length;
++        const nextLine = Math.max(0, Math.min(Math.floor(line), Math.max(0, lineCount - 1)));
++        const currentLine = this.state.lines[nextLine] || "";
++        const nextCol = Math.max(0, Math.min(Math.floor(col), currentLine.length));
++        this.state.cursorLine = nextLine;
++        this.setCursorCol(nextCol);
++    }
++    getSelection() {
++        return this.selectionRange ?? undefined;
++    }
++    setSelection(anchor, focus) {
++        this.selectionRange = { anchor: this.clampPoint(anchor), focus: this.clampPoint(focus) };
++        this.tui.requestRender();
++    }
++    clearSelection() {
++        this.selectionRange = null;
++        this.tui.requestRender();
++    }
++    clampPoint(point) {
++        const line = Math.max(0, Math.min(Math.floor(point.line), Math.max(0, this.state.lines.length - 1)));
++        const col = Math.max(0, Math.min(Math.floor(point.col), (this.state.lines[line] || "").length));
++        return { line, col };
++    }
++    normalizedSelection() {
++        if (!this.selectionRange)
++            return null;
++        const anchor = this.clampPoint(this.selectionRange.anchor);
++        const focus = this.clampPoint(this.selectionRange.focus);
++        const reversed = anchor.line > focus.line || (anchor.line === focus.line && anchor.col > focus.col);
++        const start = reversed ? focus : anchor;
++        const end = reversed ? anchor : focus;
++        return start.line === end.line && start.col === end.col ? null : { start, end };
++    }
++    deleteSelectionInternal() {
++        const selection = this.normalizedSelection();
++        if (!selection)
++            return false;
++        const prefix = (this.state.lines[selection.start.line] || "").slice(0, selection.start.col);
++        const suffix = (this.state.lines[selection.end.line] || "").slice(selection.end.col);
++        this.state.lines.splice(selection.start.line, selection.end.line - selection.start.line + 1, prefix + suffix);
++        this.state.cursorLine = selection.start.line;
++        this.setCursorCol(selection.start.col);
++        this.selectionRange = null;
++        return true;
++    }
++    replaceSelection(text) {
++        const hasSelection = this.normalizedSelection() !== null;
++        if (!hasSelection && !text)
++            return false;
++        this.cancelAutocomplete();
++        this.pushUndoSnapshot();
++        this.lastAction = null;
++        this.historyIndex = -1;
++        this.deleteSelectionInternal();
++        if (text) {
++            this.insertTextAtCursorInternal(text);
++        }
++        else if (this.onChange) {
++            this.onChange(this.getText());
++        }
++        this.tui.requestRender();
++        return true;
++    }
++    getVisualLineMap(width) {
++        return this.buildVisualLineMap(width ?? this.lastWidth);
++    }
++    getVisibleLineMap() { return this.visibleLineMap.map(line => ({ ...line })); }
++    getAutocompleteSnapshot() {
++        const snapshot = this.autocompleteRenderSnapshot;
++        if (!snapshot)
++            return undefined;
++        return {
++            generation: snapshot.generation,
++            selectedIndex: snapshot.selectedIndex,
++            visibleRows: snapshot.visibleRows.map((row) => ({ ...row })),
++        };
++    }
++    moveAutocompleteSelection(delta) {
++        if (!this.autocompleteState || !this.autocompleteList || this.autocompleteItemIds.length === 0)
++            return false;
++        const step = Math.trunc(delta);
++        if (step === 0)
++            return false;
++        const count = this.autocompleteItemIds.length;
++        const selected = this.autocompleteList.getSelectedIndex();
++        const next = ((selected + step) % count + count) % count;
++        this.autocompleteList.setSelectedIndex(next);
++        this.autocompleteRenderSnapshot = null;
++        this.tui.requestRender();
++        return true;
++    }
++    scrollAutocomplete(delta) {
++        if (!this.autocompleteState || !this.autocompleteList || !this.autocompleteList.scrollBy(delta))
++            return false;
++        this.autocompleteRenderSnapshot = null;
++        this.tui.requestRender();
++        return true;
++    }
++    selectAutocompleteItem(generation, itemId) {
++        const snapshot = this.autocompleteRenderSnapshot;
++        if (!snapshot || snapshot.generation !== generation || generation !== this.autocompleteGeneration)
++            return false;
++        const row = snapshot.visibleRows.find((candidate) => candidate.selectable && candidate.itemId === itemId);
++        if (!row || this.autocompleteItemIds[row.absoluteIndex] !== itemId || !this.autocompleteList)
++            return false;
++        this.autocompleteList.setSelectedIndex(row.absoluteIndex);
++        this.autocompleteRenderSnapshot = null;
++        this.tui.requestRender();
++        return true;
++    }
++    completeAutocompleteSelection() {
++        return this.applyAutocompleteSelection(false).applied;
++    }
++    activateAutocompleteSelection(source) {
++        return this.applyAutocompleteSelection(source === "enter" || source === "mouse");
++    }
++    applyAutocompleteSelection(submitSlash) {
++        if (!this.autocompleteState || !this.autocompleteList || !this.autocompleteProvider)
++            return { applied: false };
++        const selected = this.autocompleteList.getSelectedItem();
++        if (!selected)
++            return { applied: false };
++        const slash = this.autocompletePrefix.startsWith("/");
++        this.pushUndoSnapshot();
++        this.lastAction = null;
++        const result = this.autocompleteProvider.applyCompletion(this.state.lines, this.state.cursorLine, this.state.cursorCol, selected, this.autocompletePrefix);
++        this.state.lines = result.lines;
++        this.state.cursorLine = result.cursorLine;
++        this.setCursorCol(result.cursorCol);
++        this.cancelAutocomplete();
++        if (submitSlash && slash) {
++            const submitText = this.consumeSubmitValue();
++            this.tui.requestRender();
++            return { applied: true, submitText };
++        }
++        if (this.onChange)
++            this.onChange(this.getText());
++        this.tui.requestRender();
++        return { applied: true };
++    }
++    setText(text, options) {
+         this.cancelAutocomplete();
+         this.lastAction = null;
+         this.historyIndex = -1; // Exit history browsing mode
+         const normalized = this.normalizeText(text);
+         // Push undo snapshot if content differs (makes programmatic changes undoable)
+-        if (this.getText() !== normalized) {
++        if (options?.recordUndo !== false && this.getText() !== normalized) {
+             this.pushUndoSnapshot();
+         }
+         this.setTextInternal(normalized);
+@@ -809,6 +988,10 @@ export class Editor {
+     insertTextAtCursor(text) {
+         if (!text)
+             return;
++        if (this.normalizedSelection()) {
++            this.replaceSelection(text);
++            return;
++        }
+         this.cancelAutocomplete();
+         this.pushUndoSnapshot();
+         this.lastAction = null;
+@@ -866,17 +1049,19 @@ export class Editor {
+     // All the editor methods from before...
+     insertCharacter(char, skipUndoCoalescing) {
+         this.historyIndex = -1; // Exit history browsing mode
++        const replacingSelection = this.normalizedSelection() !== null;
+         // Undo coalescing (fish-style):
+         // - Consecutive word chars coalesce into one undo unit
+         // - Space captures state before itself (so undo removes space+following word together)
+         // - Each space is separately undoable
+         // Skip coalescing when called from atomic operations (e.g., handlePaste)
+         if (!skipUndoCoalescing) {
+-            if (isWhitespaceChar(char) || this.lastAction !== "type-word") {
++            if (replacingSelection || isWhitespaceChar(char) || this.lastAction !== "type-word") {
+                 this.pushUndoSnapshot();
+             }
+             this.lastAction = "type-word";
+         }
++        this.deleteSelectionInternal();
+         const line = this.state.lines[this.state.cursorLine] || "";
+         const before = line.slice(0, this.state.cursorCol);
+         const after = line.slice(this.state.cursorCol);
+@@ -923,6 +1108,7 @@ export class Editor {
+         this.historyIndex = -1; // Exit history browsing mode
+         this.lastAction = null;
+         this.pushUndoSnapshot();
++        this.deleteSelectionInternal();
+         // Some terminals (e.g. tmux popups with extended-keys-format=csi-u) re-encode
+         // control bytes inside bracketed paste as CSI-u Ctrl+<letter> sequences
+         // (ESC [ <codepoint> ; 5 u). Decode those back to their literal byte so the
+@@ -977,6 +1163,10 @@ export class Editor {
+         this.insertTextAtCursorInternal(filteredText);
+     }
+     addNewLine() {
++        if (this.normalizedSelection()) {
++            this.replaceSelection("\n");
++            return;
++        }
+         this.cancelAutocomplete();
+         this.historyIndex = -1; // Exit history browsing mode
+         this.lastAction = null;
+@@ -1006,8 +1196,9 @@ export class Editor {
+         const currentLine = this.state.lines[this.state.cursorLine] || "";
+         return this.state.cursorCol > 0 && currentLine[this.state.cursorCol - 1] === "\\";
+     }
+-    submitValue() {
++    consumeSubmitValue() {
+         this.cancelAutocomplete();
++        this.selectionRange = null;
+         const result = this.expandPasteMarkers(this.state.lines.join("\n")).trim();
+         this.state = { lines: [""], cursorLine: 0, cursorCol: 0 };
+         this.pastes.clear();
+@@ -1018,12 +1209,24 @@ export class Editor {
+         this.lastAction = null;
+         if (this.onChange)
+             this.onChange("");
++        return result;
++    }
++    submitValue() {
++        const result = this.consumeSubmitValue();
+         if (this.onSubmit)
+             this.onSubmit(result);
+     }
+     handleBackspace() {
+         this.historyIndex = -1; // Exit history browsing mode
+         this.lastAction = null;
++        if (this.normalizedSelection()) {
++            this.cancelAutocomplete();
++            this.pushUndoSnapshot();
++            this.deleteSelectionInternal();
++            if (this.onChange)
++                this.onChange(this.getText());
++            return;
++        }
+         if (this.state.cursorCol > 0) {
+             this.pushUndoSnapshot();
+             // Delete grapheme before cursor (handles emojis, combining characters, etc.)
+@@ -1204,6 +1407,7 @@ export class Editor {
+         this.setCursorCol(currentLine.length);
+     }
+     deleteToStartOfLine() {
++        this.cancelAutocomplete();
+         this.historyIndex = -1; // Exit history browsing mode
+         const currentLine = this.state.lines[this.state.cursorLine] || "";
+         if (this.state.cursorCol > 0) {
+@@ -1328,6 +1532,14 @@ export class Editor {
+     handleForwardDelete() {
+         this.historyIndex = -1; // Exit history browsing mode
+         this.lastAction = null;
++        if (this.normalizedSelection()) {
++            this.cancelAutocomplete();
++            this.pushUndoSnapshot();
++            this.deleteSelectionInternal();
++            if (this.onChange)
++                this.onChange(this.getText());
++            return;
++        }
+         const currentLine = this.state.lines[this.state.cursorLine] || "";
+         if (this.state.cursorCol < currentLine.length) {
+             this.pushUndoSnapshot();
+@@ -1644,6 +1856,9 @@ export class Editor {
+         const snapshot = this.undoStack.pop();
+         if (!snapshot)
+             return;
++        // A restored buffer invalidates old selection coordinates and async completion requests.
++        this.cancelAutocomplete();
++        this.selectionRange = null;
+         Object.assign(this.state, snapshot);
+         this.lastAction = null;
+         this.preferredVisualCol = null;
+@@ -1878,6 +2093,15 @@ export class Editor {
+             this.state.cursorCol === snapshotCol);
+     }
+     applyAutocompleteSuggestions(suggestions, state) {
++        const occurrences = new Map();
++        this.autocompleteItemIds = suggestions.items.map((item) => {
++            const identity = JSON.stringify([item.value, item.label, item.description ?? ""]);
++            const occurrence = occurrences.get(identity) ?? 0;
++            occurrences.set(identity, occurrence + 1);
++            return JSON.stringify([identity, occurrence]);
++        });
++        this.autocompleteGeneration += 1;
++        this.autocompleteRenderSnapshot = null;
+         this.autocompletePrefix = suggestions.prefix;
+         this.autocompleteList = this.createAutocompleteList(suggestions.prefix, suggestions.items);
+         const bestMatchIndex = this.getBestAutocompleteMatchIndex(suggestions.items, suggestions.prefix);
+@@ -1899,6 +2123,8 @@ export class Editor {
+         this.autocompleteState = null;
+         this.autocompleteList = undefined;
+         this.autocompletePrefix = "";
++        this.autocompleteItemIds = [];
++        this.autocompleteRenderSnapshot = null;
+     }
+     cancelAutocomplete() {
+         this.cancelAutocompleteRequest();
+diff --git a/dist/components/input.d.ts b/dist/components/input.d.ts
+index 32d03e6acdcf03a58c8a84f99b73ecd24bca29eb..1f51d1bd61fd0228bb0d65c2bdc3fa3a7d63edd9 100644
+--- a/dist/components/input.d.ts
++++ b/dist/components/input.d.ts
+@@ -16,6 +16,12 @@ export declare class Input implements Component, Focusable {
+     private undoStack;
+     getValue(): string;
+     setValue(value: string): void;
++    getCursor(): number;
++    setCursor(offset: number): void;
++    getSelection(): { anchor: number; focus: number } | undefined;
++    setSelection(anchor: number, focus: number): void;
++    replaceSelection(text: string): boolean;
++    getPointerOffset(column: number): number;
+     handleInput(data: string): void;
+     private insertCharacter;
+     private handleBackspace;
+diff --git a/dist/components/input.js b/dist/components/input.js
+index 5a8780c8b2e97f5d58a239c11a6c9aa6e1a26391..73a9e73bd15bdb38478c2661ca1b463f41402e54 100644
+--- a/dist/components/input.js
++++ b/dist/components/input.js
+@@ -1,5 +1,5 @@
+ import { getKeybindings } from "../keybindings.js";
+-import { decodeKittyPrintable } from "../keys.js";
++import { decodeKittyPrintable, Key, matchesKey } from "../keys.js";
+ import { KillRing } from "../kill-ring.js";
+ import { CURSOR_MARKER } from "../tui.js";
+ import { UndoStack } from "../undo-stack.js";
+@@ -11,6 +11,8 @@ const segmenter = getSegmenter();
+ export class Input {
+     value = "";
+     cursor = 0; // Cursor position in the value
++    selectionAnchor;
++    viewportStart = 0;
+     onSubmit;
+     onEscape;
+     /** Focusable interface - set by TUI when focus changes */
+@@ -27,8 +29,56 @@ export class Input {
+         return this.value;
+     }
+     setValue(value) {
++        // Programmatic values start a new field; do not retain an earlier field/secret's undo history.
++        this.undoStack.clear();
++        this.lastAction = null;
+         this.value = value;
+         this.cursor = Math.min(this.cursor, value.length);
++        this.selectionAnchor = undefined;
++    }
++    getCursor() { return this.cursor; }
++    setCursor(offset) {
++        this.cursor = this.snapOffset(offset);
++        this.selectionAnchor = undefined;
++        this.lastAction = null;
++    }
++    snapOffset(offset) {
++        const clamped = Math.max(0, Math.min(offset, this.value.length));
++        for (const part of segmenter.segment(this.value)) {
++            if (clamped >= part.index && clamped < part.index + part.segment.length) return part.index;
++        }
++        return clamped;
++    }
++    getSelection() {
++        return this.selectionAnchor === undefined || this.selectionAnchor === this.cursor
++            ? undefined : { anchor: this.selectionAnchor, focus: this.cursor };
++    }
++    setSelection(anchor, focus) {
++        this.selectionAnchor = this.snapOffset(anchor);
++        this.cursor = this.snapOffset(focus);
++        this.lastAction = null;
++    }
++    replaceSelection(text) {
++        const selection = this.getSelection();
++        if (!selection) return false;
++        const start = Math.min(selection.anchor, selection.focus);
++        const end = Math.max(selection.anchor, selection.focus);
++        this.pushUndo();
++        this.value = this.value.slice(0, start) + text + this.value.slice(end);
++        this.cursor = start + text.length;
++        this.selectionAnchor = undefined;
++        this.lastAction = null;
++        return true;
++    }
++    // Map display cells (including the two-cell prompt) to UTF-16 grapheme boundaries.
++    getPointerOffset(column) {
++        let col = 2;
++        for (const part of segmenter.segment(this.value.slice(this.viewportStart))) {
++            const width = Math.max(1, visibleWidth(part.segment));
++            if (column < col + width) return this.viewportStart + part.index;
++            col += width;
++        }
++        return this.value.length;
+     }
+     handleInput(data) {
+         // Handle bracketed paste mode
+@@ -62,6 +112,26 @@ export class Input {
+             return;
+         }
+         const kb = getKeybindings();
++        const shiftedMovement = [
++            [Key.shift(Key.left), "\x1b[D"], [Key.shift(Key.right), "\x1b[C"],
++            [Key.shift(Key.home), "\x01"], [Key.shift(Key.end), "\x05"],
++            [Key.ctrlShift(Key.left), "\x1bb"], [Key.ctrlShift(Key.right), "\x1bf"],
++        ].find(([key]) => matchesKey(data, key));
++        if (shiftedMovement) {
++            const anchor = this.selectionAnchor ?? this.cursor;
++            this.selectionAnchor = undefined;
++            this.handleInput(shiftedMovement[1]);
++            this.selectionAnchor = anchor;
++            return;
++        }
++        const selection = this.getSelection();
++        if (selection && (kb.matches(data, "tui.editor.cursorLeft") || kb.matches(data, "tui.editor.cursorRight"))) {
++            this.setCursor(kb.matches(data, "tui.editor.cursorLeft")
++                ? Math.min(selection.anchor, selection.focus) : Math.max(selection.anchor, selection.focus));
++            return;
++        }
++        if (["tui.editor.cursorLineStart", "tui.editor.cursorLineEnd", "tui.editor.cursorWordLeft", "tui.editor.cursorWordRight"]
++            .some(key => kb.matches(data, key))) this.selectionAnchor = undefined;
+         // Escape/Cancel
+         if (kb.matches(data, "tui.select.cancel")) {
+             if (this.onEscape)
+@@ -172,6 +242,7 @@ export class Input {
+         }
+     }
+     insertCharacter(char) {
++        if (this.replaceSelection(char)) return;
+         // Undo coalescing: consecutive word chars coalesce into one undo unit
+         if (isWhitespaceChar(char) || this.lastAction !== "type-word") {
+             this.pushUndo();
+@@ -181,6 +252,7 @@ export class Input {
+         this.cursor += char.length;
+     }
+     handleBackspace() {
++        if (this.replaceSelection("")) return;
+         this.lastAction = null;
+         if (this.cursor > 0) {
+             this.pushUndo();
+@@ -193,6 +265,7 @@ export class Input {
+         }
+     }
+     handleForwardDelete() {
++        if (this.replaceSelection("")) return;
+         this.lastAction = null;
+         if (this.cursor < this.value.length) {
+             this.pushUndo();
+@@ -204,6 +277,7 @@ export class Input {
+         }
+     }
+     deleteToLineStart() {
++        if (this.replaceSelection("")) return;
+         if (this.cursor === 0)
+             return;
+         this.pushUndo();
+@@ -214,6 +288,7 @@ export class Input {
+         this.cursor = 0;
+     }
+     deleteToLineEnd() {
++        if (this.replaceSelection("")) return;
+         if (this.cursor >= this.value.length)
+             return;
+         this.pushUndo();
+@@ -223,6 +298,7 @@ export class Input {
+         this.value = this.value.slice(0, this.cursor);
+     }
+     deleteWordBackwards() {
++        if (this.replaceSelection("")) return;
+         if (this.cursor === 0)
+             return;
+         // Save lastAction before cursor movement (moveWordBackwards resets it)
+@@ -239,6 +315,7 @@ export class Input {
+         this.cursor = deleteFrom;
+     }
+     deleteWordForward() {
++        if (this.replaceSelection("")) return;
+         if (this.cursor >= this.value.length)
+             return;
+         // Save lastAction before cursor movement (moveWordForwards resets it)
+@@ -257,6 +334,7 @@ export class Input {
+         const text = this.killRing.peek();
+         if (!text)
+             return;
++        if (this.replaceSelection(text)) return;
+         this.pushUndo();
+         this.value = this.value.slice(0, this.cursor) + text + this.value.slice(this.cursor);
+         this.cursor += text.length;
+@@ -286,6 +364,7 @@ export class Input {
+             return;
+         this.value = snapshot.value;
+         this.cursor = snapshot.cursor;
++        this.selectionAnchor = undefined;
+         this.lastAction = null;
+     }
+     moveWordBackwards() {
+@@ -350,10 +429,11 @@ export class Input {
+         }
+     }
+     handlePaste(pastedText) {
++        const cleanText = pastedText.replace(/\r\n/g, "").replace(/\r/g, "").replace(/\n/g, "").replace(/\t/g, "    ");
++        if (this.replaceSelection(cleanText)) return;
+         this.lastAction = null;
+         this.pushUndo();
+         // Clean the pasted text - remove newlines and carriage returns
+-        const cleanText = pastedText.replace(/\r\n/g, "").replace(/\r/g, "").replace(/\n/g, "").replace(/\t/g, "    ");
+         // Insert at cursor position
+         this.value = this.value.slice(0, this.cursor) + cleanText + this.value.slice(this.cursor);
+         this.cursor += cleanText.length;
+@@ -415,7 +495,21 @@ export class Input {
+         const marker = this.focused ? CURSOR_MARKER : "";
+         // Use inverse video to show cursor
+         const cursorChar = `\x1b[7m${atCursor}\x1b[27m`; // ESC[7m = reverse video, ESC[27m = normal
+-        const textWithCursor = beforeCursor + marker + cursorChar + afterCursor;
++        this.viewportStart = this.cursor - cursorDisplay;
++        let textWithCursor = beforeCursor + marker + cursorChar + afterCursor;
++        const selection = this.getSelection();
++        if (selection) {
++            const start = Math.min(selection.anchor, selection.focus);
++            const end = Math.max(selection.anchor, selection.focus);
++            textWithCursor = "";
++            for (const part of segmenter.segment(visibleText)) {
++                const offset = this.viewportStart + part.index;
++                if (part.index === cursorDisplay) textWithCursor += marker;
++                textWithCursor += offset >= start && offset < end
++                    ? `\x1b[7m${part.segment}\x1b[27m` : part.segment;
++            }
++            if (cursorDisplay === visibleText.length) textWithCursor += marker + " ";
++        }
+         // Calculate visual width
+         const visualLength = visibleWidth(textWithCursor);
+         const padding = " ".repeat(Math.max(0, availableWidth - visualLength));
+diff --git a/dist/components/markdown.d.ts b/dist/components/markdown.d.ts
+index e836b2e5f739a19864e166905c4dc66d7446313a..c38d5605a0b084d414a4e23c0c11edc420a01269 100644
+--- a/dist/components/markdown.d.ts
++++ b/dist/components/markdown.d.ts
+@@ -22,6 +22,8 @@ export interface DefaultTextStyle {
+  * Each function takes text and returns styled text with ANSI codes.
+  */
+ export interface MarkdownTheme {
++    /** SeekTTY opt-in: changes whenever any theme/highlighter output can change. */
++    cacheKey?: () => string;
+     heading: (text: string) => string;
+     link: (text: string) => string;
+     linkUrl: (text: string) => string;
+@@ -40,7 +42,18 @@ export interface MarkdownTheme {
+     /** Prefix applied to each rendered code block line (default: "  ") */
+     codeBlockIndent?: string;
+ }
++/**
++ * Read-only copy projection for the most recently rendered Markdown width.
++ * Added by SeekTTY for official dsh 0.1.1-rc.2 / pi-tui 0.73.1 only.
++ */
++export interface MarkdownSelectionLine {
++    readonly text: string;
++    readonly displayStartCell: number;
++    readonly joinerAfter: string;
++}
+ export declare class Markdown implements Component {
++    /** SeekTTY native history adapter, pi-tui 0.73.1 only; retains source spaces. */
++    renderUnpadded(width: number): string[];
+     private text;
+     private paddingX;
+     private paddingY;
+@@ -50,9 +63,11 @@ export declare class Markdown implements Component {
+     private cachedText?;
+     private cachedWidth?;
+     private cachedLines?;
++    private cachedSelectionLines?;
+     constructor(text: string, paddingX: number, paddingY: number, theme: MarkdownTheme, defaultTextStyle?: DefaultTextStyle);
+     setText(text: string): void;
+     invalidate(): void;
++    getSelectionLines(): readonly MarkdownSelectionLine[];
+     render(width: number): string[];
+     /**
+      * Apply default text style to a string.
+diff --git a/dist/components/markdown.js b/dist/components/markdown.js
+index 7dc27474f3e6e61be59d448f40c0a4e6b249e2b8..c46451bfbaefc4215e992b1e8abe20d0e2acdcbf 100644
+--- a/dist/components/markdown.js
++++ b/dist/components/markdown.js
+@@ -1,6 +1,124 @@
+ import { Marked, Tokenizer } from "marked";
++import { LineCache } from "../line-cache.js";
++const projectionCache = new LineCache();
++// Preserve JSON value semantics without escaping/copying long source strings.
++function tokenFingerprint(value) {
++    const strings = [];
++    const shape = JSON.stringify(value, (_key, item) => {
++        if (typeof item !== "string") return item;
++        strings.push(item);
++        return "";
++    });
++    return [shape, ...strings];
++}
++function sameTokenFingerprint(left, right) {
++    return left.length === right.length && left.every((value, index) => value === right[index]);
++}
+ import { getCapabilities, hyperlink, isImageLine } from "../terminal-image.js";
+-import { applyBackgroundToLine, visibleWidth, wrapTextWithAnsi } from "../utils.js";
++import { applyBackgroundToLine, extractAnsiCode, truncateToWidth, visibleWidth, wrapTextWithAnsi, wrapTextWithAnsiDetailed, } from "../utils.js";
++const COPY_START = "\x1b_seektty-copy:start\x07";
++const COPY_END = "\x1b_seektty-copy:end\x07";
++const COPY_SKIP = "\x1b_seektty-copy:skip\x07";
++const COPY_JOIN_PREFIX = "\x1b_seektty-copy:join:";
++const COPY_MARKER_SUFFIX = "\x07";
++function copyJoinMarker(joiner) {
++    if (joiner === "\n") {
++        return `${COPY_JOIN_PREFIX}hard${COPY_MARKER_SUFFIX}`;
++    }
++    if (joiner === "") {
++        return `${COPY_JOIN_PREFIX}none${COPY_MARKER_SUFFIX}`;
++    }
++    return `${COPY_JOIN_PREFIX}spaces:${joiner.length}${COPY_MARKER_SUFFIX}`;
++}
++function markCopyText(text) {
++    return `${COPY_START}${text}${COPY_END}`;
++}
++function stripProjectionMarkers(text) {
++    return text.replace(/\x1b_seektty-copy:[^\x07]*\x07/g, "");
++}
++function stripAnsi(text) {
++    let result = "";
++    let index = 0;
++    while (index < text.length) {
++        const ansi = extractAnsiCode(text, index);
++        if (ansi) {
++            index += ansi.length;
++            continue;
++        }
++        result += text[index];
++        index += 1;
++    }
++    return result;
++}
++function selectionProjection(line, displayPadding, defaultJoiner) {
++    const context = `${displayPadding}:${defaultJoiner}`;
++    const hit = projectionCache.get(line, context);
++    if (hit !== undefined) return { ...hit };
++    const result = selectionProjectionUncached(line, displayPadding, defaultJoiner);
++    projectionCache.set(line, result, result.text.length + result.joinerAfter.length, context);
++    return { ...result };
++}
++function selectionProjectionUncached(line, displayPadding, defaultJoiner) {
++    let before = "";
++    let selected = "";
++    let mode = "before";
++    let marked = false;
++    let skipped = false;
++    let joinerAfter = defaultJoiner;
++    let index = 0;
++    while (index < line.length) {
++        const ansi = extractAnsiCode(line, index);
++        if (ansi) {
++            if (ansi.code === COPY_START) {
++                marked = true;
++                mode = "selected";
++            }
++            else if (ansi.code === COPY_END) {
++                mode = "after";
++            }
++            else if (ansi.code === COPY_SKIP) {
++                skipped = true;
++            }
++            else if (ansi.code.startsWith(COPY_JOIN_PREFIX)) {
++                const encoded = ansi.code.slice(COPY_JOIN_PREFIX.length, -COPY_MARKER_SUFFIX.length);
++                if (encoded === "hard") {
++                    joinerAfter = "\n";
++                }
++                else if (encoded === "none") {
++                    joinerAfter = "";
++                }
++                else if (encoded.startsWith("spaces:")) {
++                    const count = Number.parseInt(encoded.slice("spaces:".length), 10);
++                    joinerAfter = " ".repeat(Number.isFinite(count) ? Math.max(0, count) : 0);
++                }
++            }
++            else if (mode === "selected") {
++                selected += ansi.code;
++            }
++            else if (mode === "before") {
++                before += ansi.code;
++            }
++            index += ansi.length;
++            continue;
++        }
++        if (mode === "selected") {
++            selected += line[index];
++        }
++        else if (mode === "before") {
++            before += line[index];
++        }
++        index += 1;
++    }
++    if (skipped) {
++        return { text: "", displayStartCell: displayPadding, joinerAfter };
++    }
++    const text = marked ? stripAnsi(selected) : stripAnsi(line).trimEnd();
++    return {
++        text,
++        displayStartCell: displayPadding + (marked ? visibleWidth(before) : 0),
++        joinerAfter,
++    };
++}
+ const STRICT_STRIKETHROUGH_REGEX = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
+ class StrictStrikethroughTokenizer extends Tokenizer {
+     del(src) {
+@@ -22,6 +140,23 @@ markdownParser.setOptions({
+     tokenizer: new StrictStrikethroughTokenizer(),
+ });
+ export class Markdown {
++    // SeekTTY native history, pi-tui 0.73.1 only. Use the renderer's source
++    // projection to remove display padding while retaining source whitespace.
++    renderUnpadded(width) {
++        const lines = this.render(width);
++        return lines.map((line, index) => {
++            const source = this.cachedSelectionLines?.[index];
++            return source ? truncateToWidth(line, source.displayStartCell + visibleWidth(source.text), "", false) : line;
++        });
++    }
++    tokenCache = [];
++    nextTokenCache;
++    tokenCursor = 0;
++    nextTokenCharacters = 0;
++    layoutContext;
++    logicalLayouts = [];
++    paddedInputs = [];
++    paddedOutputs = [];
+     text;
+     paddingX; // Left/right padding
+     paddingY; // Top/bottom padding
+@@ -32,6 +167,7 @@ export class Markdown {
+     cachedText;
+     cachedWidth;
+     cachedLines;
++    cachedSelectionLines;
+     constructor(text, paddingX, paddingY, theme, defaultTextStyle) {
+         this.text = text;
+         this.paddingX = paddingX;
+@@ -41,12 +177,28 @@ export class Markdown {
+     }
+     setText(text) {
+         this.text = text;
++        const retained = this.theme.cacheKey === undefined ? undefined : this.tokenCache;
++        const layout = retained === undefined ? undefined : [this.layoutContext, this.logicalLayouts, this.paddedInputs, this.paddedOutputs];
+         this.invalidate();
++        if (retained !== undefined) this.tokenCache = retained;
++        if (layout !== undefined) [this.layoutContext, this.logicalLayouts, this.paddedInputs, this.paddedOutputs] = layout;
+     }
+     invalidate() {
++        this.tokenCache = [];
++        this.nextTokenCache = undefined;
++        this.tokenCursor = 0;
++        this.nextTokenCharacters = 0;
++        this.layoutContext = undefined;
++        this.logicalLayouts = [];
++        this.paddedInputs = [];
++        this.paddedOutputs = [];
+         this.cachedText = undefined;
+         this.cachedWidth = undefined;
+         this.cachedLines = undefined;
++        this.cachedSelectionLines = undefined;
++    }
++    getSelectionLines() {
++        return this.cachedSelectionLines ?? [];
+     }
+     render(width) {
+         // Check cache
+@@ -55,6 +207,10 @@ export class Markdown {
+         }
+         // Calculate available width for content (subtract horizontal padding)
+         const contentWidth = Math.max(1, width - this.paddingX * 2);
++        const layoutContext = this.theme.cacheKey === undefined ? undefined
++            : JSON.stringify([this.theme.cacheKey(), width, this.paddingX, this.paddingY, getCapabilities()]);
++        const reuseLayout = layoutContext !== undefined && layoutContext === this.layoutContext;
++        const nextLogicalLayouts = [];
+         // Don't render anything if there's no actual text
+         if (!this.text || this.text.trim() === "") {
+             const result = [];
+@@ -62,6 +218,7 @@ export class Markdown {
+             this.cachedText = this.text;
+             this.cachedWidth = width;
+             this.cachedLines = result;
++            this.cachedSelectionLines = [];
+             return result;
+         }
+         // Replace tabs with 3 spaces for consistent rendering
+@@ -70,28 +227,60 @@ export class Markdown {
+         const tokens = markdownParser.lexer(normalizedText);
+         // Convert tokens to styled terminal output
+         const renderedLines = [];
++        this.nextTokenCache = [];
++        this.tokenCursor = 0;
++        this.nextTokenCharacters = 0;
+         for (let i = 0; i < tokens.length; i++) {
+             const token = tokens[i];
+             const nextToken = tokens[i + 1];
+             const tokenLines = this.renderToken(token, contentWidth, nextToken?.type);
+-            renderedLines.push(...tokenLines);
++            for (const line of tokenLines) renderedLines.push(line);
+         }
++        this.tokenCache = this.nextTokenCache;
++        this.nextTokenCache = undefined;
+         // Wrap lines (NO padding, NO background yet)
+         const wrappedLines = [];
+-        for (const line of renderedLines) {
++        const selectionLines = [];
++        for (let renderedLineIndex = 0; renderedLineIndex < renderedLines.length; renderedLineIndex++) {
++            const line = renderedLines[renderedLineIndex];
++            const hasFollowingLogicalLine = renderedLineIndex < renderedLines.length - 1;
++            const previous = reuseLayout ? this.logicalLayouts[renderedLineIndex] : undefined;
++            if (previous !== undefined && previous.source === line && previous.following === hasFollowingLogicalLine) {
++                for (const line of previous.lines) wrappedLines.push(line);
++                for (const part of previous.projections) selectionLines.push({ ...part });
++                nextLogicalLayouts.push(previous);
++                continue;
++            }
++            const start = wrappedLines.length;
+             if (isImageLine(line)) {
+                 wrappedLines.push(line);
++                selectionLines.push({ text: "", displayStartCell: this.paddingX, joinerAfter: "" });
+             }
+             else {
+-                wrappedLines.push(...wrapTextWithAnsi(line, contentWidth));
++                const wrapped = wrapTextWithAnsiDetailed(line, contentWidth);
++                for (let wrappedIndex = 0; wrappedIndex < wrapped.length; wrappedIndex++) {
++                    const part = wrapped[wrappedIndex];
++                    const isLastPart = wrappedIndex === wrapped.length - 1;
++                    const defaultJoiner = part.separator ?? (isLastPart && hasFollowingLogicalLine ? "\n" : "");
++                    wrappedLines.push(stripProjectionMarkers(part.text));
++                    selectionLines.push(selectionProjection(part.text, this.paddingX, defaultJoiner));
++                }
+             }
++            nextLogicalLayouts.push({ source: line, following: hasFollowingLogicalLine,
++                lines: wrappedLines.slice(start), projections: selectionLines.slice(start).map(part => ({ ...part })) });
+         }
+         // Add margins and background to each wrapped line
+         const leftMargin = " ".repeat(this.paddingX);
+         const rightMargin = " ".repeat(this.paddingX);
+         const bgFn = this.defaultTextStyle?.bgColor;
+         const contentLines = [];
+-        for (const line of wrappedLines) {
++        for (const [lineIndex, line] of wrappedLines.entries()) {
++            // Opaque background callbacks can depend on mutable external state.
++            // Only pure padding is reused; callback output is always recomputed.
++            if (!bgFn && reuseLayout && this.paddedInputs[lineIndex] === line) {
++                contentLines.push(this.paddedOutputs[lineIndex]);
++                continue;
++            }
+             if (isImageLine(line)) {
+                 contentLines.push(line);
+                 continue;
+@@ -107,6 +296,10 @@ export class Markdown {
+                 contentLines.push(lineWithMargins + " ".repeat(paddingNeeded));
+             }
+         }
++        this.layoutContext = layoutContext;
++        this.logicalLayouts = nextLogicalLayouts;
++        this.paddedInputs = wrappedLines.slice();
++        this.paddedOutputs = contentLines.slice();
+         // Add top/bottom padding (empty lines)
+         const emptyLine = " ".repeat(width);
+         const emptyLines = [];
+@@ -116,10 +309,17 @@ export class Markdown {
+         }
+         // Combine top padding, content, and bottom padding
+         const result = [...emptyLines, ...contentLines, ...emptyLines];
++        const paddingProjection = { text: "", displayStartCell: this.paddingX, joinerAfter: "" };
++        const resultSelectionLines = [
++            ...new Array(this.paddingY).fill(paddingProjection),
++            ...selectionLines,
++            ...new Array(this.paddingY).fill(paddingProjection),
++        ];
+         // Update cache
+         this.cachedText = this.text;
+         this.cachedWidth = width;
+         this.cachedLines = result;
++        this.cachedSelectionLines = resultSelectionLines;
+         return result.length > 0 ? result : [""];
+     }
+     /**
+@@ -193,6 +393,21 @@ export class Markdown {
+         };
+     }
+     renderToken(token, width, nextTokenType, styleContext) {
++        if (styleContext !== undefined || this.theme.cacheKey === undefined) return this.renderTokenUncached(token, width, nextTokenType, styleContext);
++        const key = tokenFingerprint([this.theme.cacheKey(), getCapabilities(), width, nextTokenType, token]);
++        const index = this.tokenCursor++;
++        const previous = this.tokenCache[index];
++        const result = previous !== undefined && sameTokenFingerprint(previous.key, key)
++            ? previous.result : this.renderTokenUncached(token, width, nextTokenType, styleContext);
++        const characters = key.reduce((size, part) => size + part.length, 0)
++            + result.reduce((size, line) => size + line.length, 0);
++        if (index < 20_000 && this.nextTokenCharacters + characters <= 8_000_000) {
++            (this.nextTokenCache ?? this.tokenCache)[index] = { key, result };
++            this.nextTokenCharacters += characters;
++        }
++        return [...result];
++    }
++    renderTokenUncached(token, width, nextTokenType, styleContext) {
+         const lines = [];
+         switch (token.type) {
+             case "heading": {
+@@ -231,36 +446,43 @@ export class Markdown {
+             }
+             case "code": {
+                 const indent = this.theme.codeBlockIndent ?? "  ";
+-                lines.push(this.theme.codeBlockBorder(`\`\`\`${token.lang || ""}`));
++                const codeWidth = Math.max(1, width - visibleWidth(indent));
+                 if (this.theme.highlightCode) {
+                     const highlightedLines = this.theme.highlightCode(token.text, token.lang);
+                     for (const hlLine of highlightedLines) {
+-                        lines.push(`${indent}${hlLine}`);
++                        const wrapped = wrapTextWithAnsiDetailed(hlLine, codeWidth);
++                        for (const part of wrapped) {
++                            const padding = " ".repeat(Math.max(0, codeWidth - visibleWidth(part.text)));
++                            lines.push(`${indent}${this.theme.codeBlock(markCopyText(part.text) + padding)}${part.separator !== undefined ? copyJoinMarker(part.separator) : ""}`);
++                        }
+                     }
+                 }
+                 else {
+                     // Split code by newlines and style each line
+                     const codeLines = token.text.split("\n");
+                     for (const codeLine of codeLines) {
+-                        lines.push(`${indent}${this.theme.codeBlock(codeLine)}`);
++                        const wrapped = wrapTextWithAnsiDetailed(codeLine, codeWidth);
++                        for (const part of wrapped) {
++                            const padding = " ".repeat(Math.max(0, codeWidth - visibleWidth(part.text)));
++                            lines.push(`${indent}${this.theme.codeBlock(markCopyText(part.text) + padding)}${part.separator !== undefined ? copyJoinMarker(part.separator) : ""}`);
++                        }
+                     }
+                 }
+-                lines.push(this.theme.codeBlockBorder("```"));
+                 if (nextTokenType && nextTokenType !== "space") {
+                     lines.push(""); // Add spacing after code blocks (unless space token follows)
+                 }
+                 break;
+             }
+             case "list": {
+-                const listLines = this.renderList(token, 0, styleContext);
+-                lines.push(...listLines);
++                const listLines = this.renderList(token, 0, styleContext, width);
++                for (const line of listLines) lines.push(line);
+                 // Don't add spacing after lists if a space token follows
+                 // (the space token will handle it)
+                 break;
+             }
+             case "table": {
+                 const tableLines = this.renderTable(token, width, nextTokenType, styleContext);
+-                lines.push(...tableLines);
++                for (const line of tableLines) lines.push(line);
+                 break;
+             }
+             case "blockquote": {
+@@ -287,7 +509,7 @@ export class Markdown {
+                 for (let i = 0; i < quoteTokens.length; i++) {
+                     const quoteToken = quoteTokens[i];
+                     const nextQuoteToken = quoteTokens[i + 1];
+-                    renderedQuoteLines.push(...this.renderToken(quoteToken, quoteContentWidth, nextQuoteToken?.type, quoteInlineStyleContext));
++                    for (const line of this.renderToken(quoteToken, quoteContentWidth, nextQuoteToken?.type, quoteInlineStyleContext)) renderedQuoteLines.push(line);
+                 }
+                 // Avoid rendering an extra empty quote line before the outer blockquote spacing.
+                 while (renderedQuoteLines.length > 0 && renderedQuoteLines[renderedQuoteLines.length - 1] === "") {
+@@ -295,9 +517,11 @@ export class Markdown {
+                 }
+                 for (const quoteLine of renderedQuoteLines) {
+                     const styledLine = applyQuoteStyle(quoteLine);
+-                    const wrappedLines = wrapTextWithAnsi(styledLine, quoteContentWidth);
++                    const wrappedLines = wrapTextWithAnsiDetailed(styledLine, quoteContentWidth);
+                     for (const wrappedLine of wrappedLines) {
+-                        lines.push(this.theme.quoteBorder("│ ") + wrappedLine);
++                        const content = styledLine.includes(COPY_START) ? wrappedLine.text : markCopyText(wrappedLine.text);
++                        lines.push(this.theme.quoteBorder("│ ") + content +
++                            (wrappedLine.separator !== undefined ? copyJoinMarker(wrappedLine.separator) : ""));
+                     }
+                 }
+                 if (nextTokenType && nextTokenType !== "space") {
+@@ -306,7 +530,7 @@ export class Markdown {
+                 break;
+             }
+             case "hr":
+-                lines.push(this.theme.hr("─".repeat(Math.min(width, 80))));
++                lines.push(`${COPY_SKIP}${this.theme.hr("─".repeat(Math.min(width, 80)))}`);
+                 if (nextTokenType && nextTokenType !== "space") {
+                     lines.push(""); // Add spacing after horizontal rules (unless space token follows)
+                 }
+@@ -417,7 +641,7 @@ export class Markdown {
+     /**
+      * Render a list with proper nesting support
+      */
+-    renderList(token, depth, styleContext) {
++    renderList(token, depth, styleContext, width) {
+         const lines = [];
+         const indent = "  ".repeat(depth);
+         // Use the list's start property (defaults to 1 for ordered lists)
+@@ -426,7 +650,8 @@ export class Markdown {
+             const item = token.items[i];
+             const bullet = token.ordered ? `${startNumber + i}. ` : "- ";
+             // Process item tokens to handle nested lists
+-            const itemLines = this.renderListItem(item.tokens || [], depth, styleContext);
++            const contentWidth = Math.max(1, width - visibleWidth(indent) - visibleWidth(bullet));
++            const itemLines = this.renderListItem(item.tokens || [], depth, styleContext, width, contentWidth);
+             if (itemLines.length > 0) {
+                 // First line - check if it's a nested list
+                 // A nested list will start with indent (spaces) followed by cyan bullet
+@@ -449,8 +674,8 @@ export class Markdown {
+                         lines.push(line);
+                     }
+                     else {
+-                        // Regular content - add parent indent + 2 spaces for continuation
+-                        lines.push(`${indent}  ${line}`);
++                        // Regular content - align continuation lines with the item text.
++                        lines.push(`${indent}${" ".repeat(visibleWidth(bullet))}${line}`);
+                     }
+                 }
+             }
+@@ -464,14 +689,14 @@ export class Markdown {
+      * Render list item tokens, handling nested lists
+      * Returns lines WITHOUT the parent indent (renderList will add it)
+      */
+-    renderListItem(tokens, parentDepth, styleContext) {
++    renderListItem(tokens, parentDepth, styleContext, width, contentWidth) {
+         const lines = [];
+         for (const token of tokens) {
+             if (token.type === "list") {
+                 // Nested list - render with one additional indent level
+                 // These lines will have their own indent, so we just add them as-is
+-                const nestedLines = this.renderList(token, parentDepth + 1, styleContext);
+-                lines.push(...nestedLines);
++                const nestedLines = this.renderList(token, parentDepth + 1, styleContext, width);
++                for (const line of nestedLines) lines.push(line);
+             }
+             else if (token.type === "text") {
+                 // Text content (may have inline tokens)
+@@ -488,20 +713,27 @@ export class Markdown {
+             else if (token.type === "code") {
+                 // Code block in list item
+                 const indent = this.theme.codeBlockIndent ?? "  ";
+-                lines.push(this.theme.codeBlockBorder(`\`\`\`${token.lang || ""}`));
++                const codeWidth = Math.max(1, contentWidth - visibleWidth(indent));
+                 if (this.theme.highlightCode) {
+                     const highlightedLines = this.theme.highlightCode(token.text, token.lang);
+                     for (const hlLine of highlightedLines) {
+-                        lines.push(`${indent}${hlLine}`);
++                        const wrapped = wrapTextWithAnsiDetailed(hlLine, codeWidth);
++                        for (const part of wrapped) {
++                            const padding = " ".repeat(Math.max(0, codeWidth - visibleWidth(part.text)));
++                            lines.push(`${indent}${this.theme.codeBlock(markCopyText(part.text) + padding)}${part.separator !== undefined ? copyJoinMarker(part.separator) : ""}`);
++                        }
+                     }
+                 }
+                 else {
+                     const codeLines = token.text.split("\n");
+                     for (const codeLine of codeLines) {
+-                        lines.push(`${indent}${this.theme.codeBlock(codeLine)}`);
++                        const wrapped = wrapTextWithAnsiDetailed(codeLine, codeWidth);
++                        for (const part of wrapped) {
++                            const padding = " ".repeat(Math.max(0, codeWidth - visibleWidth(part.text)));
++                            lines.push(`${indent}${this.theme.codeBlock(markCopyText(part.text) + padding)}${part.separator !== undefined ? copyJoinMarker(part.separator) : ""}`);
++                        }
+                     }
+                 }
+-                lines.push(this.theme.codeBlockBorder("```"));
+             }
+             else {
+                 // Other token types - try to render as inline
+diff --git a/dist/components/select-list.d.ts b/dist/components/select-list.d.ts
+index 9db54d907f801e43208a462bca925f2905787b7a..3266ae6f1a277d3b82b51e52c56f95a85df06861 100644
+--- a/dist/components/select-list.d.ts
++++ b/dist/components/select-list.d.ts
+@@ -22,6 +22,17 @@ export interface SelectListLayoutOptions {
+     minPrimaryColumnWidth?: number;
+     maxPrimaryColumnWidth?: number;
+     truncatePrimary?: (context: SelectListTruncatePrimaryContext) => string;
++    /** Opt-in marker at the final description budget; other lists retain their default. */
++    descriptionEllipsis?: string;
++}
++export interface SelectListRenderSnapshot {
++    selectedIndex: number;
++    startIndex: number;
++    visibleRows: Array<{
++        visualRow: number;
++        absoluteIndex: number;
++        item: SelectItem;
++    }>;
+ }
+ export declare class SelectList implements Component {
+     private items;
+@@ -35,7 +46,14 @@ export declare class SelectList implements Component {
+     onSelectionChange?: (item: SelectItem) => void;
+     constructor(items: SelectItem[], maxVisible: number, theme: SelectListTheme, layout?: SelectListLayoutOptions);
+     setFilter(filter: string): void;
++    private lastRenderSnapshot;
++    private scrollOffset;
+     setSelectedIndex(index: number): void;
++    getSelectedIndex(): number;
++    getScrollOffset(): number;
++    setScrollOffset(offset: number): void;
++    scrollBy(delta: number): boolean;
++    getRenderSnapshot(): SelectListRenderSnapshot | null;
+     invalidate(): void;
+     render(width: number): string[];
+     handleInput(keyData: string): void;
+diff --git a/dist/components/select-list.js b/dist/components/select-list.js
+index 2e9231150951c3d3f3e13ac8ae8d623f06d38d5d..d12792cfcbe09dd7d90765346ea8edef523dbed6 100644
+--- a/dist/components/select-list.js
++++ b/dist/components/select-list.js
+@@ -10,6 +10,8 @@ export class SelectList {
+     filteredItems = [];
+     selectedIndex = 0;
+     maxVisible = 5;
++    scrollOffset = 0;
++    lastRenderSnapshot = null;
+     theme;
+     layout;
+     onSelect;
+@@ -18,7 +20,7 @@ export class SelectList {
+     constructor(items, maxVisible, theme, layout = {}) {
+         this.items = items;
+         this.filteredItems = items;
+-        this.maxVisible = maxVisible;
++        this.maxVisible = Math.max(1, maxVisible);
+         this.theme = theme;
+         this.layout = layout;
+     }
+@@ -26,9 +28,35 @@ export class SelectList {
+         this.filteredItems = this.items.filter((item) => item.value.toLowerCase().startsWith(filter.toLowerCase()));
+         // Reset selection when filter changes
+         this.selectedIndex = 0;
++        this.scrollOffset = 0;
++        this.lastRenderSnapshot = null;
+     }
+     setSelectedIndex(index) {
+         this.selectedIndex = Math.max(0, Math.min(index, this.filteredItems.length - 1));
++        // Reveal only an item outside the viewport; clicks and repaints never center it.
++        if (this.selectedIndex < this.scrollOffset) {
++            this.setScrollOffset(this.selectedIndex);
++        }
++        else if (this.selectedIndex >= this.scrollOffset + this.maxVisible) {
++            this.setScrollOffset(this.selectedIndex - this.maxVisible + 1);
++        }
++    }
++    getSelectedIndex() {
++        return this.selectedIndex;
++    }
++    getScrollOffset() {
++        return this.scrollOffset;
++    }
++    setScrollOffset(offset) {
++        this.scrollOffset = clamp(Math.trunc(offset), 0, Math.max(0, this.filteredItems.length - this.maxVisible));
++    }
++    scrollBy(delta) {
++        const before = this.scrollOffset;
++        this.setScrollOffset(before + delta);
++        return this.scrollOffset !== before;
++    }
++    getRenderSnapshot() {
++        return this.lastRenderSnapshot;
+     }
+     invalidate() {
+         // No cached state to invalidate currently
+@@ -38,12 +66,14 @@ export class SelectList {
+         // If no items match filter, show message
+         if (this.filteredItems.length === 0) {
+             lines.push(this.theme.noMatch("  No matching commands"));
++            this.lastRenderSnapshot = { selectedIndex: -1, startIndex: 0, visibleRows: [] };
+             return lines;
+         }
+         const primaryColumnWidth = this.getPrimaryColumnWidth();
+-        // Calculate visible range with scrolling
+-        const startIndex = Math.max(0, Math.min(this.selectedIndex - Math.floor(this.maxVisible / 2), this.filteredItems.length - this.maxVisible));
++        // Wheel browsing is independent of selection and survives every repaint.
++        const startIndex = this.scrollOffset;
+         const endIndex = Math.min(startIndex + this.maxVisible, this.filteredItems.length);
++        const visibleRows = [];
+         // Render visible items
+         for (let i = startIndex; i < endIndex; i++) {
+             const item = this.filteredItems[i];
+@@ -52,6 +82,7 @@ export class SelectList {
+             const isSelected = i === this.selectedIndex;
+             const descriptionSingleLine = item.description ? normalizeToSingleLine(item.description) : undefined;
+             lines.push(this.renderItem(item, isSelected, width, descriptionSingleLine, primaryColumnWidth));
++            visibleRows.push({ visualRow: lines.length - 1, absoluteIndex: i, item });
+         }
+         // Add scroll indicators if needed
+         if (startIndex > 0 || endIndex < this.filteredItems.length) {
+@@ -59,18 +90,19 @@ export class SelectList {
+             // Truncate if too long for terminal
+             lines.push(this.theme.scrollInfo(truncateToWidth(scrollText, width - 2, "")));
+         }
++        this.lastRenderSnapshot = { selectedIndex: this.selectedIndex, startIndex, visibleRows };
+         return lines;
+     }
+     handleInput(keyData) {
+         const kb = getKeybindings();
+         // Up arrow - wrap to bottom when at top
+         if (kb.matches(keyData, "tui.select.up")) {
+-            this.selectedIndex = this.selectedIndex === 0 ? this.filteredItems.length - 1 : this.selectedIndex - 1;
++            this.setSelectedIndex(this.selectedIndex === 0 ? this.filteredItems.length - 1 : this.selectedIndex - 1);
+             this.notifySelectionChange();
+         }
+         // Down arrow - wrap to top when at bottom
+         else if (kb.matches(keyData, "tui.select.down")) {
+-            this.selectedIndex = this.selectedIndex === this.filteredItems.length - 1 ? 0 : this.selectedIndex + 1;
++            this.setSelectedIndex(this.selectedIndex === this.filteredItems.length - 1 ? 0 : this.selectedIndex + 1);
+             this.notifySelectionChange();
+         }
+         // Enter
+@@ -99,7 +131,7 @@ export class SelectList {
+             const descriptionStart = prefixWidth + truncatedValueWidth + spacing.length;
+             const remainingWidth = width - descriptionStart - 2; // -2 for safety
+             if (remainingWidth > MIN_DESCRIPTION_WIDTH) {
+-                const truncatedDesc = truncateToWidth(descriptionSingleLine, remainingWidth, "");
++                const truncatedDesc = truncateToWidth(descriptionSingleLine, remainingWidth, this.layout.descriptionEllipsis ?? "");
+                 if (isSelected) {
+                     return this.theme.selectedText(`${prefix}${truncatedValue}${spacing}${truncatedDesc}`);
+                 }
+diff --git a/dist/keybindings.d.ts b/dist/keybindings.d.ts
+index a6a5a7e8e0eee248adc8b0883b4ce61d7bd26470..1001bb8463e8ca59c31390dfb3d583d57501ceeb 100644
+--- a/dist/keybindings.d.ts
++++ b/dist/keybindings.d.ts
+@@ -125,7 +125,7 @@ export declare const TUI_KEYBINDINGS: {
+         readonly description: "Yank pop";
+     };
+     readonly "tui.editor.undo": {
+-        readonly defaultKeys: "ctrl+-";
++        readonly defaultKeys: readonly ["ctrl+z", "ctrl+-"];
+         readonly description: "Undo";
+     };
+     readonly "tui.input.newLine": {
+diff --git a/dist/keybindings.js b/dist/keybindings.js
+index 60d400872183f1f6b754b61d3ccbf6708219215d..c0161b806238f2bd05995136dd7fcacf347a1ff5 100644
+--- a/dist/keybindings.js
++++ b/dist/keybindings.js
+@@ -62,7 +62,7 @@ export const TUI_KEYBINDINGS = {
+     },
+     "tui.editor.yank": { defaultKeys: "ctrl+y", description: "Yank" },
+     "tui.editor.yankPop": { defaultKeys: "alt+y", description: "Yank pop" },
+-    "tui.editor.undo": { defaultKeys: "ctrl+-", description: "Undo" },
++    "tui.editor.undo": { defaultKeys: ["ctrl+z", "ctrl+-"], description: "Undo" },
+     "tui.input.newLine": { defaultKeys: "shift+enter", description: "Insert newline" },
+     "tui.input.submit": { defaultKeys: "enter", description: "Submit input" },
+     "tui.input.tab": { defaultKeys: "tab", description: "Tab / autocomplete" },
+diff --git a/dist/line-cache.js b/dist/line-cache.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..6fc7f327c5fda85b88594f8177f988b3094d71d2
+--- /dev/null
++++ b/dist/line-cache.js
+@@ -0,0 +1,34 @@
++// SeekTTY bounded memoization of pure ANSI line transformations.
++export class LineCache {
++    contexts = new Map();
++    entries = new Map();
++    characters = 0;
++    get(key, context = "") {
++        const hit = this.contexts.get(context)?.get(key);
++        if (hit === undefined) return undefined;
++        this.entries.delete(hit);
++        this.entries.set(hit, true);
++        return hit.value;
++    }
++    set(key, value, valueCharacters, context = "") {
++        const size = key.length + context.length + valueCharacters;
++        if (size > 8000000) return;
++        let bucket = this.contexts.get(context);
++        const prior = bucket?.get(key);
++        if (prior) { this.characters -= prior.size; this.entries.delete(prior); }
++        while (this.entries.size >= 20000 || this.characters + size > 8000000) {
++            const oldest = this.entries.keys().next().value;
++            this.characters -= oldest.size;
++            const owner = this.contexts.get(oldest.context);
++            owner.delete(oldest.key);
++            if (owner.size === 0) this.contexts.delete(oldest.context);
++            this.entries.delete(oldest);
++        }
++        bucket = this.contexts.get(context);
++        if (!bucket) { bucket = new Map(); this.contexts.set(context, bucket); }
++        const entry = { key, context, value, size };
++        bucket.set(key, entry);
++        this.entries.set(entry, true);
++        this.characters += size;
++    }
++}
+diff --git a/dist/stdin-buffer.js b/dist/stdin-buffer.js
+index a3d15d66cf5f86b9d794e59c0646c0ba2ec73ce5..6ed3ca60dadad5c0fc24d3fcadcb0e44afaaf65c 100644
+--- a/dist/stdin-buffer.js
++++ b/dist/stdin-buffer.js
+@@ -18,6 +18,10 @@
+  */
+ import { EventEmitter } from "events";
+ const ESC = "\x1b";
++const SGR_MOUSE_PREFIX = "\x1b[<";
++const MAX_MOUSE_SEQUENCE = 64;
++const OSC_PREFIX = "\x1b]";
++const MAX_OSC_SEQUENCE = 1024;
+ const BRACKETED_PASTE_START = "\x1b[200~";
+ const BRACKETED_PASTE_END = "\x1b[201~";
+ /**
+@@ -163,6 +167,54 @@ function extractCompleteSequences(buffer) {
+     let pos = 0;
+     while (pos < buffer.length) {
+         const remaining = buffer.slice(pos);
++        // Escape followed by another escape-prefixed event is not Alt+Escape.
++        // Consuming both ESC bytes together would type the mouse report's tail.
++        if (remaining.startsWith(ESC + ESC)) {
++            sequences.push(ESC);
++            pos++;
++            continue;
++        }
++        if (remaining.startsWith(OSC_PREFIX)) {
++            // Color-query replies may span stdin chunks well beyond the key
++            // timeout. Frame them atomically, without quadratic prefix scans.
++            let end = -1;
++            let restart = -1;
++            for (let index = OSC_PREFIX.length; index < remaining.length; index++) {
++                if (remaining[index] === "\x07") {
++                    end = index + 1;
++                    break;
++                }
++                if (remaining[index] === ESC) {
++                    if (index + 1 === remaining.length) break;
++                    if (remaining[index + 1] === "\\") end = index + 2;
++                    else restart = index;
++                    break;
++                }
++            }
++            if (restart !== -1) {
++                pos += restart;
++                continue;
++            }
++            if (end === -1) return { sequences, remainder: remaining };
++            if (end <= MAX_OSC_SEQUENCE) sequences.push(remaining.slice(0, end));
++            pos += end;
++            continue;
++        }
++        if (remaining.startsWith(SGR_MOUSE_PREFIX)) {
++            const end = remaining.search(/[Mm]/);
++            const restart = remaining.indexOf(ESC, SGR_MOUSE_PREFIX.length);
++            // A fresh ESC cancels a truncated report, not the new key/event.
++            if (restart !== -1 && (end === -1 || restart < end)) {
++                pos += restart;
++                continue;
++            }
++            if (end === -1) return { sequences, remainder: remaining };
++            // Deliver malformed complete frames atomically for the mouse decoder
++            // to consume. Never split their printable bytes into keypresses.
++            if (end + 1 <= MAX_MOUSE_SEQUENCE) sequences.push(remaining.slice(0, end + 1));
++            pos += end + 1;
++            continue;
++        }
+         // Try to extract a sequence starting at this position
+         if (remaining.startsWith(ESC)) {
+             // Find the end of this escape sequence
+@@ -263,6 +315,9 @@ export class StdinBuffer extends EventEmitter {
+                 for (const sequence of result.sequences) {
+                     this.emitDataSequence(sequence);
+                 }
++                // The paste opener is a new sequence, so a preceding bare ESC
++                // is a key, not an unfinished prefix to silently discard.
++                if (result.remainder === ESC) this.emitDataSequence(ESC);
+             }
+             this.pendingKittyPrintableCodepoint = undefined;
+             this.buffer = this.buffer.slice(startIndex + BRACKETED_PASTE_START.length);
+@@ -288,6 +343,22 @@ export class StdinBuffer extends EventEmitter {
+         for (const sequence of result.sequences) {
+             this.emitDataSequence(sequence);
+         }
++        // Only ambiguous key prefixes need a timeout. Once a mouse prefix is
++        // known, keep it until its terminator/new ESC, even on a slow transport.
++        if (this.buffer.startsWith(SGR_MOUSE_PREFIX)) {
++            // Keep an invalid sentinel to consume an oversized frame's tail
++            // without letting that tail become a valid click or ordinary text.
++            if (this.buffer.length > MAX_MOUSE_SEQUENCE) this.buffer = SGR_MOUSE_PREFIX + "!";
++            return;
++        }
++        if (this.buffer.startsWith("\x1b[M")) return;
++        if (this.buffer.startsWith(OSC_PREFIX)) {
++            // Preserve a split ST while bounding malformed/oversized reports.
++            if (this.buffer.length > MAX_OSC_SEQUENCE) {
++                this.buffer = OSC_PREFIX + "!" + (this.buffer.endsWith(ESC) ? ESC : "");
++            }
++            return;
++        }
+         if (this.buffer.length > 0) {
+             this.timeout = setTimeout(() => {
+                 const flushed = this.flush();
+@@ -311,7 +382,7 @@ export class StdinBuffer extends EventEmitter {
+             clearTimeout(this.timeout);
+             this.timeout = null;
+         }
+-        if (this.buffer.length === 0) {
++        if (this.buffer.length === 0 || this.buffer.startsWith(OSC_PREFIX)) {
+             return [];
+         }
+         const sequences = [this.buffer];
+diff --git a/dist/terminal.js b/dist/terminal.js
+index 3545b284ce2da594cc728803feb607a34cea5ca0..008cc8f2a0606fde1b054ba1c85f9d17f60f4d9b 100644
+--- a/dist/terminal.js
++++ b/dist/terminal.js
+@@ -16,6 +16,7 @@ export class ProcessTerminal {
+     resizeHandler;
+     _kittyProtocolActive = false;
+     _modifyOtherKeysActive = false;
++    _protocolsRestored = false;
+     stdinBuffer;
+     stdinDataHandler;
+     progressInterval;
+@@ -40,6 +41,7 @@ export class ProcessTerminal {
+     }
+     start(onInput, onResize) {
+         this.inputHandler = onInput;
++        this._protocolsRestored = false;
+         this.resizeHandler = onResize;
+         // Save previous state and enable raw mode
+         this.wasRaw = process.stdin.isRaw || false;
+@@ -49,7 +51,7 @@ export class ProcessTerminal {
+         process.stdin.setEncoding("utf8");
+         process.stdin.resume();
+         // Enable bracketed paste mode - terminal will wrap pastes in \x1b[200~ ... \x1b[201~
+-        process.stdout.write("\x1b[?2004h");
++        (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))("\x1b[?2004h");
+         // Set up resize handler immediately
+         process.stdout.on("resize", this.resizeHandler);
+         // Refresh terminal dimensions - they may be stale after suspend/resume
+@@ -82,7 +84,7 @@ export class ProcessTerminal {
+         // Forward individual sequences to the input handler
+         this.stdinBuffer.on("data", (sequence) => {
+             // Check for Kitty protocol response (only if not already enabled)
+-            if (!this._kittyProtocolActive) {
++            if (!this._protocolsRestored && !this._kittyProtocolActive) {
+                 const match = sequence.match(kittyResponsePattern);
+                 if (match) {
+                     this._kittyProtocolActive = true;
+@@ -92,7 +94,7 @@ export class ProcessTerminal {
+                     // Flag 2 = report event types (press/repeat/release)
+                     // Flag 4 = report alternate keys (shifted key, base layout key)
+                     // Base layout key enables shortcuts to work with non-Latin keyboard layouts
+-                    process.stdout.write("\x1b[>7u");
++                    (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))("\x1b[>7u");
+                     return; // Don't forward protocol response to TUI
+                 }
+             }
+@@ -128,10 +130,10 @@ export class ProcessTerminal {
+     queryAndEnableKittyProtocol() {
+         this.setupStdinBuffer();
+         process.stdin.on("data", this.stdinDataHandler);
+-        process.stdout.write("\x1b[?u");
++        (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))("\x1b[?u");
+         setTimeout(() => {
+-            if (!this._kittyProtocolActive && !this._modifyOtherKeysActive) {
+-                process.stdout.write("\x1b[>4;2m");
++            if (!this._protocolsRestored && this.inputHandler && !this._kittyProtocolActive && !this._modifyOtherKeysActive) {
++                (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))("\x1b[>4;2m");
+                 this._modifyOtherKeysActive = true;
+             }
+         }, 150);
+@@ -165,16 +167,44 @@ export class ProcessTerminal {
+             // koffi not available — Shift+Tab won't be distinguishable from Tab
+         }
+     }
++    // SeekTTY fatal guards need protocol bytes restored before any async cleanup.
++    // Keep this method private to the pinned runtime contract via duck typing.
++    restoreProtocolsSync() {
++        this._protocolsRestored = true;
++        this.inputHandler = undefined;
++        if (this.stdinBuffer) {
++            this.stdinBuffer.destroy();
++            this.stdinBuffer = undefined;
++        }
++        if (this.stdinDataHandler) {
++            process.stdin.removeListener("data", this.stdinDataHandler);
++            this.stdinDataHandler = undefined;
++        }
++        (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))("\x1b[?2004l");
++        if (this._kittyProtocolActive) {
++            (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))("\x1b[<u");
++            this._kittyProtocolActive = false;
++            setKittyProtocolActive(false);
++        }
++        if (this._modifyOtherKeysActive) {
++            (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))("\x1b[>4;0m");
++            this._modifyOtherKeysActive = false;
++        }
++    }
++    restoreRawModeSync() {
++        if (process.stdin.setRawMode)
++            process.stdin.setRawMode(this.wasRaw);
++    }
+     async drainInput(maxMs = 1000, idleMs = 50) {
+         if (this._kittyProtocolActive) {
+             // Disable Kitty keyboard protocol first so any late key releases
+             // do not generate new Kitty escape sequences.
+-            process.stdout.write("\x1b[<u");
++            (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))("\x1b[<u");
+             this._kittyProtocolActive = false;
+             setKittyProtocolActive(false);
+         }
+         if (this._modifyOtherKeysActive) {
+-            process.stdout.write("\x1b[>4;0m");
++            (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))("\x1b[>4;0m");
+             this._modifyOtherKeysActive = false;
+         }
+         const previousHandler = this.inputHandler;
+@@ -203,18 +233,18 @@ export class ProcessTerminal {
+     }
+     stop() {
+         if (this.clearProgressInterval()) {
+-            process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
++            (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
+         }
+         // Disable bracketed paste mode
+-        process.stdout.write("\x1b[?2004l");
++        (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))("\x1b[?2004l");
+         // Disable Kitty keyboard protocol if not already done by drainInput()
+         if (this._kittyProtocolActive) {
+-            process.stdout.write("\x1b[<u");
++            (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))("\x1b[<u");
+             this._kittyProtocolActive = false;
+             setKittyProtocolActive(false);
+         }
+         if (this._modifyOtherKeysActive) {
+-            process.stdout.write("\x1b[>4;0m");
++            (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))("\x1b[>4;0m");
+             this._modifyOtherKeysActive = false;
+         }
+         // Clean up StdinBuffer
+@@ -242,7 +272,7 @@ export class ProcessTerminal {
+         }
+     }
+     write(data) {
+-        process.stdout.write(data);
++        (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))(data);
+         if (this.writeLogPath) {
+             try {
+                 fs.appendFileSync(this.writeLogPath, data, { encoding: "utf8" });
+@@ -261,47 +291,47 @@ export class ProcessTerminal {
+     moveBy(lines) {
+         if (lines > 0) {
+             // Move down
+-            process.stdout.write(`\x1b[${lines}B`);
++            (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))(`\x1b[${lines}B`);
+         }
+         else if (lines < 0) {
+             // Move up
+-            process.stdout.write(`\x1b[${-lines}A`);
++            (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))(`\x1b[${-lines}A`);
+         }
+         // lines === 0: no movement
+     }
+     hideCursor() {
+-        process.stdout.write("\x1b[?25l");
++        (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))("\x1b[?25l");
+     }
+     showCursor() {
+-        process.stdout.write("\x1b[?25h");
++        (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))("\x1b[?25h");
+     }
+     clearLine() {
+-        process.stdout.write("\x1b[K");
++        (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))("\x1b[K");
+     }
+     clearFromCursor() {
+-        process.stdout.write("\x1b[J");
++        (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))("\x1b[J");
+     }
+     clearScreen() {
+-        process.stdout.write("\x1b[2J\x1b[H"); // Clear screen and move to home (1,1)
++        (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))("\x1b[2J\x1b[H"); // Clear screen and move to home (1,1)
+     }
+     setTitle(title) {
+         // OSC 0;title BEL - set terminal window title
+-        process.stdout.write(`\x1b]0;${title}\x07`);
++        (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))(`\x1b]0;${title}\x07`);
+     }
+     setProgress(active) {
+         if (active) {
+             // OSC 9;4;3 - indeterminate progress
+-            process.stdout.write(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
++            (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
+             if (!this.progressInterval) {
+                 this.progressInterval = setInterval(() => {
+-                    process.stdout.write(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
++                    (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
+                 }, TERMINAL_PROGRESS_KEEPALIVE_MS);
+             }
+         }
+         else {
+             this.clearProgressInterval();
+             // OSC 9;4;0 - clear progress
+-            process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
++            (this.__seekttyWrite ?? process.stdout.write.bind(process.stdout))(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
+         }
+     }
+     clearProgressInterval() {
+diff --git a/dist/tui.d.ts b/dist/tui.d.ts
+index 8394d461feed1287deba13443c7afe79ff45c151..68c11704d39bf661fa797fc622e55c934b2ef641 100644
+--- a/dist/tui.d.ts
++++ b/dist/tui.d.ts
+@@ -155,8 +155,28 @@ export declare class TUI extends Container {
+     private stopped;
+     private focusOrderCounter;
+     private overlayStack;
++    lastFrameGeometry: {
++        terminalWidth: number;
++        terminalHeight: number;
++        rootScreenOrigin: {
++            col: number;
++            row: number;
++        };
++        rootSliceOffset: number;
++        overlays: {
++            row: number;
++            col: number;
++            width: number;
++            height: number;
++            zOrder: number;
++            capturing: boolean;
++        }[];
++    };
++    /** Called after post-slice composite geometry is frozen. */
++    onAfterRender?: () => void;
+     constructor(terminal: Terminal, showHardwareCursor?: boolean);
+     get fullRedraws(): number;
++    getLastFrameGeometry(): TUI["lastFrameGeometry"];
+     getShowHardwareCursor(): boolean;
+     setShowHardwareCursor(enabled: boolean): void;
+     getClearOnShrink(): boolean;
+@@ -187,6 +207,12 @@ export declare class TUI extends Container {
+     private queryCellSize;
+     stop(): void;
+     requestRender(force?: boolean): void;
++    /** Reset frame bookkeeping without restarting terminal input. */
++    resetRenderState(): void;
++    /** Capture differential-render state for a terminal buffer before switching away. */
++    captureRenderState(): unknown;
++    /** Restore differential-render state after returning to the same terminal buffer. */
++    restoreRenderState(state: unknown): void;
+     private scheduleRender;
+     private handleInput;
+     private consumeCellSizeResponse;
+diff --git a/dist/tui.js b/dist/tui.js
+index b521ceb326eb8a25fc9ebc3feee4d39708296065..bed44bc90f342421d7ef2df4e2dc3fe4aedf9407 100644
+--- a/dist/tui.js
++++ b/dist/tui.js
+@@ -5,11 +5,20 @@ import * as fs from "node:fs";
+ import * as os from "node:os";
+ import * as path from "node:path";
+ import { performance } from "node:perf_hooks";
++import { LineCache } from "./line-cache.js";
++const kittyLineCache = new LineCache();
+ import { isKeyRelease, matchesKey } from "./keys.js";
+ import { deleteKittyImage, getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.js";
+ import { extractSegments, normalizeTerminalOutput, sliceByColumn, sliceWithWidth, visibleWidth } from "./utils.js";
+ const KITTY_SEQUENCE_PREFIX = "\x1b_G";
+ function extractKittyImageIds(line) {
++    const cached = kittyLineCache.get(line);
++    if (cached !== undefined) return cached;
++    const result = extractKittyImageIdsUncached(line);
++    kittyLineCache.set(line, result, result.length * 8);
++    return result;
++}
++function extractKittyImageIdsUncached(line) {
+     const sequenceStart = line.indexOf(KITTY_SEQUENCE_PREFIX);
+     if (sequenceStart === -1)
+         return [];
+@@ -94,6 +103,13 @@ export class Container {
+  * TUI - Main class for managing terminal UI with differential rendering
+  */
+ export class TUI extends Container {
++    lineResetCache = new LineCache();
++    previousResetInput = [];
++    previousResetOutput = [];
++    previousResetCode;
++    previousKittyScanInput = [];
++    previousKittyScanIds = [];
++    inputFrameQueued = false;
+     terminal;
+     previousLines = [];
+     previousKittyImageIds = new Set();
+@@ -118,6 +134,15 @@ export class TUI extends Container {
+     // Overlay stack for modal components rendered on top of base content
+     focusOrderCounter = 0;
+     overlayStack = [];
++    lastOverlayPlacements = [];
++    lastFrameGeometry = {
++        terminalWidth: 0,
++        terminalHeight: 0,
++        rootScreenOrigin: { col: 0, row: 0 },
++        rootSliceOffset: 0,
++        overlays: [],
++    };
++    onAfterRender;
+     constructor(terminal, showHardwareCursor) {
+         super();
+         this.terminal = terminal;
+@@ -128,6 +153,9 @@ export class TUI extends Container {
+     get fullRedraws() {
+         return this.fullRedrawCount;
+     }
++    getLastFrameGeometry() {
++        return this.lastFrameGeometry;
++    }
+     getShowHardwareCursor() {
+         return this.showHardwareCursor;
+     }
+@@ -307,13 +335,9 @@ export class TUI extends Container {
+         this.terminal.write("\x1b[16t");
+     }
+     stop() {
+-        this.stopped = true;
+-        if (this.renderTimer) {
+-            clearTimeout(this.renderTimer);
+-            this.renderTimer = undefined;
+-        }
++        this.stopRenderingSync();
+         // Move cursor to the end of the content to prevent overwriting/artifacts on exit
+-        if (this.previousLines.length > 0) {
++        if (!this.terminal.__seekttyManagedAlternateScreen && this.previousLines.length > 0) {
+             const targetRow = this.previousLines.length; // Line after the last content
+             const lineDiff = targetRow - this.hardwareCursorRow;
+             if (lineDiff > 0) {
+@@ -327,6 +351,62 @@ export class TUI extends Container {
+         this.terminal.showCursor();
+         this.terminal.stop();
+     }
++    // SeekTTY restores the main screen before asynchronous cleanup. Quiesce
++    // queued renders first so no frame can be painted after CSI ? 1049 l.
++    stopRenderingSync() {
++        this.stopped = true;
++        if (this.renderTimer) {
++            clearTimeout(this.renderTimer);
++            this.renderTimer = undefined;
++        }
++        this.renderRequested = false;
++    }
++    // Reset frame bookkeeping when SeekTTY switches renderers without
++    // restarting the shared terminal input/runtime connection.
++    resetRenderState() {
++        this.previousLines = [];
++        this.previousKittyImageIds = new Set();
++        this.previousWidth = 0;
++        this.previousHeight = 0;
++        this.cursorRow = 0;
++        this.hardwareCursorRow = 0;
++        this.maxLinesRendered = 0;
++        this.previousViewportTop = 0;
++    }
++    // Alternate and main screens have independent contents and cursor state.
++    // Keep the matching differential state while SeekTTY switches buffers so
++    // returning to native scrollback appends only newly rendered rows.
++    captureRenderState() {
++        return {
++            previousLines: [...this.previousLines],
++            previousKittyImageIds: new Set(this.previousKittyImageIds),
++            previousWidth: this.previousWidth,
++            previousHeight: this.previousHeight,
++            cursorRow: this.cursorRow,
++            hardwareCursorRow: this.hardwareCursorRow,
++            maxLinesRendered: this.maxLinesRendered,
++            previousViewportTop: this.previousViewportTop,
++        };
++    }
++    restoreRenderState(state) {
++        if (!state || !Array.isArray(state.previousLines)) {
++            this.resetRenderState();
++            return;
++        }
++        if (this.renderTimer) {
++            clearTimeout(this.renderTimer);
++            this.renderTimer = undefined;
++        }
++        this.renderRequested = false;
++        this.previousLines = [...state.previousLines];
++        this.previousKittyImageIds = new Set(state.previousKittyImageIds ?? []);
++        this.previousWidth = state.previousWidth ?? 0;
++        this.previousHeight = state.previousHeight ?? 0;
++        this.cursorRow = state.cursorRow ?? 0;
++        this.hardwareCursorRow = state.hardwareCursorRow ?? 0;
++        this.maxLinesRendered = state.maxLinesRendered ?? this.previousLines.length;
++        this.previousViewportTop = state.previousViewportTop ?? 0;
++    }
+     requestRender(force = false) {
+         if (force) {
+             this.previousLines = [];
+@@ -424,6 +504,23 @@ export class TUI extends Container {
+             }
+             this.focusedComponent.handleInput(data);
+             this.requestRender();
++            // Only component-owned keyboard input bypasses the stream cadence.
++            // Listener-consumed mouse gestures keep their deferred frame boundary.
++            if (this.renderTimer) clearTimeout(this.renderTimer);
++            this.renderTimer = undefined;
++            if (!this.inputFrameQueued) {
++                this.inputFrameQueued = true;
++                process.nextTick(() => {
++                    this.inputFrameQueued = false;
++                    if (this.stopped || !this.renderRequested) return;
++                    if (this.renderTimer) clearTimeout(this.renderTimer);
++                    this.renderTimer = undefined;
++                    this.renderRequested = false;
++                    this.lastRenderAt = performance.now();
++                    this.doRender();
++                    if (this.renderRequested) this.scheduleRender();
++                });
++            }
+         }
+     }
+     consumeCellSizeResponse(data) {
+@@ -592,9 +689,17 @@ export class TUI extends Container {
+             }
+             // Get final row/col with actual overlay height
+             const { row, col } = this.resolveOverlayLayout(options, overlayLines.length, termWidth, termHeight);
+-            rendered.push({ overlayLines, row, col, w: width });
++            rendered.push({ overlayLines, row, col, w: width, capturing: !entry.options?.nonCapturing, zOrder: entry.focusOrder });
+             minLinesNeeded = Math.max(minLinesNeeded, row + overlayLines.length);
+         }
++        this.lastOverlayPlacements = rendered.map((item) => ({
++            row: item.row,
++            col: item.col,
++            width: item.w,
++            height: item.overlayLines.length,
++            zOrder: item.zOrder,
++            capturing: item.capturing,
++        }));
+         // Pad to at least terminal height so overlays have screen-relative positions.
+         // Excludes maxLinesRendered: the historical high-water mark caused self-reinforcing
+         // inflation that pushed content into scrollback on terminal widen.
+@@ -621,21 +726,39 @@ export class TUI extends Container {
+     static SEGMENT_RESET = "\x1b[0m\x1b]8;;\x07";
+     applyLineResets(lines) {
+         const reset = TUI.SEGMENT_RESET;
++        const input = [...lines];
+         for (let i = 0; i < lines.length; i++) {
+             const line = lines[i];
+-            if (!isImageLine(line)) {
+-                lines[i] = normalizeTerminalOutput(line) + reset;
++            if (reset === this.previousResetCode && line === this.previousResetInput[i]) {
++                lines[i] = this.previousResetOutput[i];
++                continue;
++            }
++            let result = this.lineResetCache.get(line, reset);
++            if (result === undefined) {
++                result = isImageLine(line) ? line : normalizeTerminalOutput(line) + reset;
++                this.lineResetCache.set(line, result, result.length, reset);
+             }
++            lines[i] = result;
+         }
++        this.previousResetInput = input;
++        this.previousResetOutput = [...lines];
++        this.previousResetCode = reset;
+         return lines;
+     }
+     collectKittyImageIds(lines) {
+         const ids = new Set();
+-        for (const line of lines) {
+-            for (const id of extractKittyImageIds(line)) {
++        const lineIds = [];
++        for (let index = 0; index < lines.length; index++) {
++            const line = lines[index];
++            const cached = line === this.previousKittyScanInput[index]
++                ? this.previousKittyScanIds[index] : extractKittyImageIds(line);
++            lineIds.push(cached);
++            for (const id of cached) {
+                 ids.add(id);
+             }
+         }
++        this.previousKittyScanInput = [...lines];
++        this.previousKittyScanIds = lineIds;
+         return ids;
+     }
+     deleteKittyImages(ids) {
+@@ -749,30 +872,76 @@ export class TUI extends Container {
+         // Render all components to get new lines
+         let newLines = this.render(width);
+         // Composite overlays into the rendered lines (before differential compare)
++        this.lastOverlayPlacements = [];
+         if (this.overlayStack.length > 0) {
+             newLines = this.compositeOverlays(newLines, width, height);
+         }
++        const preSliceLength = newLines.length;
++        if (this.terminal.__seekttyManagedAlternateScreen !== false && newLines.length > height) {
++            newLines = newLines.slice(-height);
++        }
++        this.lastFrameGeometry = {
++            terminalWidth: width,
++            terminalHeight: height,
++            rootScreenOrigin: { col: 0, row: 0 },
++            rootSliceOffset: Math.max(0, preSliceLength - height),
++            overlays: this.lastOverlayPlacements,
++        };
++        this.onAfterRender?.();
+         // Extract cursor position before applying line resets (marker must be found first)
+         const cursorPos = this.extractCursorPosition(newLines, height);
+         newLines = this.applyLineResets(newLines);
+-        // Helper to clear scrollback and viewport and render all new lines
++        // SeekTTY candidate adapter (pi-tui 0.73.1 only): all components and
++        // overlays have rendered, but no retained-history diff has run.
++        if (this.terminal.__seekttyManagedAlternateScreen === false &&
++            this.terminal.__seekttyNativeFrame?.(newLines, cursorPos, width, height)) {
++            return;
++        }
++        // Helper to restore the visible window. Tall buffers must never be
++        // dumped from line 0: that replays older turns through the viewport.
+         const fullRender = (clear) => {
+             this.fullRedrawCount += 1;
+             let buffer = "\x1b[?2026h"; // Begin synchronized output
+             if (clear) {
+                 buffer += this.deleteKittyImages(this.previousKittyImageIds);
+-                buffer += "\x1b[2J\x1b[H\x1b[3J"; // Clear screen, home, then clear scrollback
++                // Home of the current screen only. Do not 2J (blank flash) or 3J
++                // (destroy native scrollback and force a history replay).
++                buffer += "\x1b[H";
+             }
+-            for (let i = 0; i < newLines.length; i++) {
+-                if (i > 0)
++            // Recovery redraws replace the physical viewport, not scrollback.
++            // The initial native paint (clear=false) still emits every row.
++            const firstPaintedLine = clear ? Math.max(0, newLines.length - height) : 0;
++            for (let i = firstPaintedLine; i < newLines.length; i++) {
++                if (i > firstPaintedLine)
+                     buffer += "\r\n";
++                if (clear && visibleWidth(newLines[i]) < width)
++                    buffer += "\x1b[2K";
+                 buffer += newLines[i];
+             }
+-            buffer += "\x1b[?2026l"; // End synchronized output
++            // newLines is already sliced to height above. Do not apply ED0
++            // (CSI 0J) to a wrap-pending last content cell: xenl keeps the
++            // cursor on that cell, so 0J erases it. Clear leftover rows with
++            // the same CR / CUD / 2K / CUU pattern used for deleted lines.
++            if (clear && newLines.length < height) {
++                const extraLines = height - newLines.length;
++                if (newLines.length === 0) {
++                    buffer += "\x1b[0J";
++                }
++                else if (extraLines > 0) {
++                    buffer += "\r";
++                    buffer += "\x1b[1B";
++                    for (let i = 0; i < extraLines; i++) {
++                        buffer += "\r\x1b[2K";
++                        if (i < extraLines - 1)
++                            buffer += "\x1b[1B";
++                    }
++                    buffer += `\x1b[${extraLines}A`;
++                }
++            }
++            buffer += "\x1b[?2026l";
+             this.terminal.write(buffer);
+             this.cursorRow = Math.max(0, newLines.length - 1);
+             this.hardwareCursorRow = this.cursorRow;
+-            // Reset max lines when clearing, otherwise track growth
+             if (clear) {
+                 this.maxLinesRendered = newLines.length;
+             }
+@@ -802,7 +971,7 @@ export class TUI extends Container {
+             return;
+         }
+         // Width changes always need a full re-render because wrapping changes.
+-        if (widthChanged) {
++        if (widthChanged && this.terminal.__seekttyManagedAlternateScreen !== false) {
+             logRedraw(`terminal width changed (${this.previousWidth} -> ${width})`);
+             fullRender(true);
+             return;
+@@ -810,7 +979,7 @@ export class TUI extends Container {
+         // Height changes normally need a full re-render to keep the visible viewport aligned,
+         // but Termux changes height when the software keyboard shows or hides.
+         // In that environment, a full redraw causes the entire history to replay on every toggle.
+-        if (heightChanged && !isTermuxSession()) {
++        if (heightChanged && this.terminal.__seekttyManagedAlternateScreen !== false && !isTermuxSession()) {
+             logRedraw(`terminal height changed (${this.previousHeight} -> ${height})`);
+             fullRender(true);
+             return;
+@@ -844,6 +1013,37 @@ export class TUI extends Container {
+             }
+             lastChanged = newLines.length - 1;
+         }
++        // Changes above the previous viewport top already live in terminal
++        // scrollback. Repainting them would require clearing the screen and
++        // rewriting the entire history, which flashes on terminals without
++        // synchronized-output support and yanks the viewport through old
++        // content. Keep scrollback as-is and repaint only from the first
++        // change that is actually visible.
++        if (firstChanged !== -1 && firstChanged < prevViewportTop) {
++            let visibleFirstChanged = -1;
++            for (let i = prevViewportTop; i < maxLines; i++) {
++                const oldLine = i < this.previousLines.length ? this.previousLines[i] : "";
++                const newLine = i < newLines.length ? newLines[i] : "";
++                if (oldLine !== newLine) {
++                    visibleFirstChanged = i;
++                    break;
++                }
++            }
++            if (visibleFirstChanged === -1) {
++                // Every change is hidden in scrollback; record the new content
++                // without touching the screen.
++                logRedraw(`suppressed scrollback-only change (firstChanged=${firstChanged} < viewportTop=${prevViewportTop})`);
++                this.positionHardwareCursor(cursorPos, newLines.length);
++                this.previousLines = newLines;
++                this.previousKittyImageIds = this.collectKittyImageIds(newLines);
++                this.previousWidth = width;
++                this.previousHeight = height;
++                this.previousViewportTop = prevViewportTop;
++                return;
++            }
++            logRedraw(`clamped firstChanged ${firstChanged} -> ${visibleFirstChanged} (viewportTop=${prevViewportTop})`);
++            firstChanged = visibleFirstChanged;
++        }
+         if (firstChanged !== -1) {
+             lastChanged = this.expandLastChangedForKittyImages(firstChanged, lastChanged);
+         }
+@@ -944,8 +1144,9 @@ export class TUI extends Container {
+         for (let i = firstChanged; i <= renderEnd; i++) {
+             if (i > firstChanged)
+                 buffer += "\r\n";
+-            buffer += "\x1b[2K"; // Clear current line
+             const line = newLines[i];
++            if (visibleWidth(line) < width)
++                buffer += "\x1b[2K";
+             const isImage = isImageLine(line);
+             if (!isImage && visibleWidth(line) > width) {
+                 // Log all lines to crash file for debugging
+diff --git a/dist/utils.d.ts b/dist/utils.d.ts
+index 45eebb9dbf0edbc96965d6a1e5e67de81d7c5c00..1b0de075a1a5f9be7118480355e49461bf1da244 100644
+--- a/dist/utils.d.ts
++++ b/dist/utils.d.ts
+@@ -26,6 +26,13 @@ export declare function extractAnsiCode(str: string, pos: number): {
+  * @returns Array of wrapped lines (NOT padded to width)
+  */
+ export declare function wrapTextWithAnsi(text: string, width: number): string[];
++export interface WrappedTextLine {
++    text: string;
++    /** Exact whitespace omitted before the next visual fragment; undefined at a logical line end. */
++    separator?: string;
++}
++/** Wrap text and retain exact soft-wrap separator metadata. */
++export declare function wrapTextWithAnsiDetailed(text: string, width: number): WrappedTextLine[];
+ /**
+  * Check if a character is whitespace.
+  */
+diff --git a/dist/utils.js b/dist/utils.js
+index 9d00544d0858681339bb780057bda825f8054ca5..71ad6e7dc33b68e09f781bf95d77e89678dda80a 100644
+--- a/dist/utils.js
++++ b/dist/utils.js
+@@ -1,4 +1,6 @@
+ import { eastAsianWidth } from "get-east-asian-width";
++import { LineCache } from "./line-cache.js";
++const wrapCache = new LineCache();
+ // Grapheme segmenter (shared instance)
+ const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+ /**
+@@ -28,7 +30,9 @@ const zeroWidthRegex = /^(?:\p{Default_Ignorable_Code_Point}|\p{Control}|\p{Mark
+ const leadingNonPrintingRegex = /^[\p{Default_Ignorable_Code_Point}\p{Control}\p{Format}\p{Mark}\p{Surrogate}]+/v;
+ const rgiEmojiRegex = /^\p{RGI_Emoji}$/v;
+ // Cache for non-ASCII strings
+-const WIDTH_CACHE_SIZE = 512;
++const WIDTH_CACHE_SIZE = 20000;
++const WIDTH_CACHE_CHARACTERS = 8000000;
++let widthCacheCharacters = 0;
+ const widthCache = new Map();
+ function isPrintableAscii(str) {
+     for (let i = 0; i < str.length; i++) {
+@@ -177,6 +181,8 @@ export function visibleWidth(str) {
+     // Check cache
+     const cached = widthCache.get(str);
+     if (cached !== undefined) {
++        widthCache.delete(str);
++        widthCache.set(str, cached);
+         return cached;
+     }
+     // Normalize: tabs to 3 spaces, strip ANSI escape codes
+@@ -207,13 +213,16 @@ export function visibleWidth(str) {
+         width += graphemeWidth(segment);
+     }
+     // Cache result
+-    if (widthCache.size >= WIDTH_CACHE_SIZE) {
++    if (str.length > WIDTH_CACHE_CHARACTERS) return width;
++    while (widthCache.size >= WIDTH_CACHE_SIZE || widthCacheCharacters + str.length > WIDTH_CACHE_CHARACTERS) {
+         const firstKey = widthCache.keys().next().value;
+         if (firstKey !== undefined) {
++            widthCacheCharacters -= firstKey.length;
+             widthCache.delete(firstKey);
+         }
+     }
+     widthCache.set(str, width);
++    widthCacheCharacters += str.length;
+     return width;
+ }
+ /**
+@@ -586,30 +595,52 @@ function splitIntoTokensWithAnsi(text) {
+  * @returns Array of wrapped lines (NOT padded to width)
+  */
+ export function wrapTextWithAnsi(text, width) {
++    return wrapTextWithAnsiDetailed(text, width).map((line) => line.text);
++}
++/**
++ * Wrap text while retaining the exact whitespace omitted at visual wrap boundaries.
++ * The additional metadata is consumed by application-owned selection serializers;
++ * ordinary render callers continue to use wrapTextWithAnsi().
++ */
++export function wrapTextWithAnsiDetailed(text, width) {
++    const context = String(width);
++    const hit = wrapCache.get(text, context);
++    if (hit !== undefined) return hit.map(part => ({ ...part }));
++    const result = wrapTextWithAnsiDetailedUncached(text, width);
++    wrapCache.set(text, result, result.reduce((size, part) => size + part.text.length + (part.separator?.length ?? 0), 0), context);
++    return result.map(part => ({ ...part }));
++}
++function wrapTextWithAnsiDetailedUncached(text, width) {
+     if (!text) {
+-        return [""];
++        return [{ text: "" }];
+     }
+     // Handle newlines by processing each line separately
+     // Track ANSI state across lines so styles carry over after literal newlines
+     const inputLines = text.split("\n");
+     const result = [];
+     const tracker = new AnsiCodeTracker();
+-    for (const inputLine of inputLines) {
++    for (let inputLineIndex = 0; inputLineIndex < inputLines.length; inputLineIndex++) {
++        const inputLine = inputLines[inputLineIndex];
+         // Prepend active ANSI codes from previous lines (except for first line)
+         const prefix = result.length > 0 ? tracker.getActiveCodes() : "";
+-        result.push(...wrapSingleLine(prefix + inputLine, width));
++        const wrappedInputLine = wrapSingleLine(prefix + inputLine, width);
++        if (inputLineIndex < inputLines.length - 1) {
++            const last = wrappedInputLine.length - 1;
++            wrappedInputLine[last] = { ...wrappedInputLine[last], separator: "\n" };
++        }
++        result.push(...wrappedInputLine);
+         // Update tracker with codes from this line for next iteration
+         updateTrackerFromText(inputLine, tracker);
+     }
+-    return result.length > 0 ? result : [""];
++    return result.length > 0 ? result : [{ text: "" }];
+ }
+ function wrapSingleLine(line, width) {
+     if (!line) {
+-        return [""];
++        return [{ text: "" }];
+     }
+     const visibleLength = visibleWidth(line);
+     if (visibleLength <= width) {
+-        return [line];
++        return [{ text: line }];
+     }
+     const wrapped = [];
+     const tracker = new AnsiCodeTracker();
+@@ -622,18 +653,19 @@ function wrapSingleLine(line, width) {
+         // Token itself is too long - break it character by character
+         if (tokenVisibleLength > width && !isWhitespace) {
+             if (currentLine) {
++                const separator = stripAnsiForWrap(currentLine).match(/ +$/)?.[0] ?? "";
+                 // Add specific reset for underline only (preserves background)
+                 const lineEndReset = tracker.getLineEndReset();
+                 if (lineEndReset) {
+                     currentLine += lineEndReset;
+                 }
+-                wrapped.push(currentLine);
++                wrapped.push({ text: currentLine, separator });
+                 currentLine = "";
+                 currentVisibleLength = 0;
+             }
+             // Break long token - breakLongWord handles its own resets
+             const broken = breakLongWord(token, width, tracker);
+-            wrapped.push(...broken.slice(0, -1));
++            wrapped.push(...broken.slice(0, -1).map((text) => ({ text, separator: "" })));
+             currentLine = broken[broken.length - 1];
+             currentVisibleLength = visibleWidth(currentLine);
+             continue;
+@@ -642,12 +674,15 @@ function wrapSingleLine(line, width) {
+         const totalNeeded = currentVisibleLength + tokenVisibleLength;
+         if (totalNeeded > width && currentVisibleLength > 0) {
+             // Trim trailing whitespace, then add underline reset (not full reset, to preserve background)
++            const separator = isWhitespace
++                ? " ".repeat(visibleWidth(token))
++                : (stripAnsiForWrap(currentLine).match(/ +$/)?.[0] ?? "");
+             let lineToWrap = currentLine.trimEnd();
+             const lineEndReset = tracker.getLineEndReset();
+             if (lineEndReset) {
+                 lineToWrap += lineEndReset;
+             }
+-            wrapped.push(lineToWrap);
++            wrapped.push({ text: lineToWrap, separator });
+             if (isWhitespace) {
+                 // Don't start new line with whitespace
+                 currentLine = tracker.getActiveCodes();
+@@ -667,10 +702,26 @@ function wrapSingleLine(line, width) {
+     }
+     if (currentLine) {
+         // No reset at end of final line - let caller handle it
+-        wrapped.push(currentLine);
++        wrapped.push({ text: currentLine });
+     }
+     // Trailing whitespace can cause lines to exceed the requested width
+-    return wrapped.length > 0 ? wrapped.map((line) => line.trimEnd()) : [""];
++    return wrapped.length > 0
++        ? wrapped.map((line) => ({ ...line, text: line.text.trimEnd() }))
++        : [{ text: "" }];
++}
++function stripAnsiForWrap(text) {
++    let result = "";
++    let index = 0;
++    while (index < text.length) {
++        const ansi = extractAnsiCode(text, index);
++        if (ansi) {
++            index += ansi.length;
++            continue;
++        }
++        result += text[index];
++        index += 1;
++    }
++    return result;
+ }
+ const PUNCTUATION_REGEX = /[(){}[\]<>.,;:'"!?+\-=*/\\|&%^$#@~`]/;
+ /**

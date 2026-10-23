@@ -1,0 +1,552 @@
+/** Dynamic DeepSeek palette for the complete terminal frame. */
+
+import {
+  visibleWidth,
+  type EditorTheme,
+  type MarkdownTheme,
+} from '@mariozechner/pi-tui'
+import { BUILT_IN_THEMES, type ResolvedTuiTheme } from './theme-config.ts'
+import type { TuiBackgroundMode, TuiRenderingSettings } from '@deepseek-ai/dsh-tui-protocol'
+import { resolveRendering } from './appearance-rendering.ts'
+import { ui } from './locale.ts'
+import { readableCanvas } from './canvas-foreground.ts'
+
+const RESET = '\u001B[0m'
+const ESC = 0x1B
+const CSI = 0x9B
+const ST = 0x9C
+const OSC = 0x9D
+const CONTROL_STRING_INTRODUCERS = new Set([0x50, 0x58, 0x5D, 0x5E, 0x5F])
+const C1_CONTROL_STRING_INTRODUCERS = new Set([0x90, 0x98, OSC, 0x9E, 0x9F])
+const SGR_PARAMETERS = /^[0-9;:]*$/u
+
+/** ANSI foreground capability used by the semantic DeepSeek palette. */
+export type TerminalColorLevel = 0 | 1 | 2 | 3
+
+interface SemanticColor {
+  readonly rgb: readonly [red: number, green: number, blue: number]
+}
+
+interface ThemePalette {
+  readonly text: SemanticColor
+  readonly brand: SemanticColor
+  readonly accent: SemanticColor
+  readonly pulse: readonly SemanticColor[]
+  readonly muted: SemanticColor
+  readonly border: SemanticColor
+  readonly success: SemanticColor
+  readonly warning: SemanticColor
+  readonly danger: SemanticColor
+  readonly statusRunning: SemanticColor
+  readonly statusWaiting: SemanticColor
+  readonly statusFailed: SemanticColor
+  readonly canvas: SemanticColor
+  readonly surface: SemanticColor
+  readonly selection: SemanticColor
+  readonly codeBackground: SemanticColor
+  readonly codeForeground: SemanticColor
+}
+
+const STATUS_COLORS = {
+  dark: {
+    running: semanticColor('#22D3EE'),
+    waiting: semanticColor('#FACC15'),
+    failed: semanticColor('#F87171'),
+  },
+  light: {
+    running: semanticColor('#0C6478'),
+    waiting: semanticColor('#854D0E'),
+    failed: semanticColor('#B91C1C'),
+  },
+} as const
+
+function semanticColor(value: string): SemanticColor {
+  const match = /^#([0-9A-Fa-f]{6})$/u.exec(value)
+  if (match === null) throw new Error(ui(`主题颜色 ${JSON.stringify(value)} 无效`, `Theme color ${JSON.stringify(value)} is invalid`))
+  const digits = match[1] ?? ''
+  return {
+    rgb: [
+      Number.parseInt(digits.slice(0, 2), 16),
+      Number.parseInt(digits.slice(2, 4), 16),
+      Number.parseInt(digits.slice(4, 6), 16),
+    ],
+  }
+}
+
+function mixColor(left: SemanticColor, right: SemanticColor, amount: number): SemanticColor {
+  const value = (index: number): number => Math.round(
+    (left.rgb[index] ?? 0) + ((right.rgb[index] ?? 0) - (left.rgb[index] ?? 0)) * amount,
+  )
+  return { rgb: [value(0), value(1), value(2)] }
+}
+
+function runtimePalette(theme: ResolvedTuiTheme): ThemePalette {
+  const brand = semanticColor(theme.colors.brand)
+  const accent = semanticColor(theme.colors.accent)
+  const border = semanticColor(theme.colors.border)
+  const pulse = [
+    border,
+    mixColor(border, brand, 0.3),
+    mixColor(border, brand, 0.62),
+    brand,
+    accent,
+    brand,
+    mixColor(border, brand, 0.62),
+    mixColor(border, brand, 0.3),
+  ]
+  const statuses = STATUS_COLORS[theme.tone]
+  return {
+    text: semanticColor(theme.colors.text),
+    brand,
+    accent,
+    pulse,
+    muted: semanticColor(theme.colors.muted),
+    border,
+    success: semanticColor(theme.colors.success),
+    warning: semanticColor(theme.colors.warning),
+    danger: semanticColor(theme.colors.danger),
+    statusRunning: statuses.running,
+    statusWaiting: statuses.waiting,
+    statusFailed: statuses.failed,
+    canvas: semanticColor(theme.colors.canvas),
+    surface: semanticColor(theme.colors.surface),
+    selection: semanticColor(theme.colors.selection),
+    codeBackground: semanticColor(theme.syntax.background),
+    codeForeground: semanticColor(theme.syntax.foreground),
+  }
+}
+
+let selectedTheme: ResolvedTuiTheme = BUILT_IN_THEMES.dark
+let rendering = resolveRendering({})
+let palette = runtimePalette(selectedTheme)
+
+/** Whether syntax rendering should emit the theme's default code background. */
+export type CodeBackgroundPolicy = 'inherit' | 'explicit'
+
+let codeHighlighter: ((code: string, lang: string | undefined, background: CodeBackgroundPolicy) => string[]) | undefined
+let codeStreamFactory: ((lang: string | undefined, background: CodeBackgroundPolicy) => import('./syntax-highlighter.ts').CodeStream) | undefined
+
+function controlStringEnd(text: string, start: number): number {
+  for (let index = start; index < text.length; index += 1) {
+    const code = text.charCodeAt(index)
+    if (code === 0x07 || code === ST) return index + 1
+    if (code === ESC && text.charCodeAt(index + 1) === 0x5C) return index + 2
+  }
+  return text.length
+}
+
+function csiEnd(text: string, start: number): number {
+  for (let index = start; index < text.length; index += 1) {
+    const code = text.charCodeAt(index)
+    if (code >= 0x40 && code <= 0x7E) return index + 1
+  }
+  return text.length
+}
+
+/**
+ * Escape untrusted terminal text while retaining harmless SGR foreground/style sequences.
+ *
+ * OSC, DCS, APC, PM, SOS, non-SGR CSI, two-byte ESC commands, carriage returns,
+ * and remaining C0/C1 controls are removed before text reaches pi-tui. Unterminated
+ * terminal strings consume the remainder rather than exposing an ambiguous suffix.
+ * @param text - terminal-bound text from Harness, extensions, files, or user metadata.
+ * @returns text safe to compose into a terminal frame.
+ */
+export function escapeTerminalText(text: string): string {
+  let escaped = ''
+  let keptStart = 0
+  const controls = /[\x00-\x08\x0B-\x1F\x7F-\x9F]/gu
+  for (let match = controls.exec(text); match !== null; match = controls.exec(text)) {
+    let index = match.index
+    const code = text.charCodeAt(index)
+    let end = index + 1
+    if (code === ESC) {
+      const next = text.charCodeAt(index + 1)
+      if (next === 0x5B) {
+        end = csiEnd(text, index + 2)
+        const final = text.charCodeAt(end - 1)
+        const parameters = text.slice(index + 2, Math.max(index + 2, end - 1))
+        if (final === 0x6D && SGR_PARAMETERS.test(parameters)) {
+          controls.lastIndex = end
+          continue
+        }
+      } else if (CONTROL_STRING_INTRODUCERS.has(next)) {
+        end = controlStringEnd(text, index + 2)
+      } else if (next >= 0x20 && next <= 0x2F) {
+        end = index + 2
+        while (text.charCodeAt(end) >= 0x20 && text.charCodeAt(end) <= 0x2F) end += 1
+        if (text.charCodeAt(end) >= 0x30 && text.charCodeAt(end) <= 0x7E) end += 1
+      } else {
+        end = index + (Number.isNaN(next) ? 1 : 2)
+      }
+    } else if (code === CSI) {
+      end = csiEnd(text, index + 1)
+    } else if (C1_CONTROL_STRING_INTRODUCERS.has(code)) {
+      end = controlStringEnd(text, index + 1)
+    }
+    escaped += text.slice(keptStart, index)
+    keptStart = end
+    controls.lastIndex = end
+  }
+  return escaped + text.slice(keptStart)
+}
+
+/**
+ * Detect terminal foreground-color depth without changing the terminal background.
+ * @param env - environment to inspect; injectable for platform-neutral tests.
+ * @returns 0 for plain text, 1 for ANSI-16, 2 for xterm-256, or 3 for truecolor.
+ */
+export function terminalColorLevel(env: Readonly<NodeJS.ProcessEnv> = process.env): TerminalColorLevel {
+  if (env === process.env && workerColorLevel !== undefined) return workerColorLevel
+  if (env.NO_COLOR !== undefined || env.TERM === 'dumb') return 0
+  const term = env.TERM?.toLowerCase() ?? ''
+  const colorTerm = env.COLORTERM?.toLowerCase() ?? ''
+  const program = env.TERM_PROGRAM?.toLowerCase() ?? ''
+  if (colorTerm === 'truecolor' || colorTerm === '24bit'
+    || term.includes('truecolor') || term.includes('24bit') || term.endsWith('-direct')
+    || env.WT_SESSION !== undefined
+    || ['iterm.app', 'wezterm', 'hyper', 'vscode'].includes(program)) return 3
+  if (term.includes('256color') || program === 'apple_terminal') return 2
+  return 1
+}
+
+/** Rendering policy is independent of capability detection (notably OSC 11 support). */
+export function renderingColorLevel(env: Readonly<NodeJS.ProcessEnv> = process.env): TerminalColorLevel {
+  const detected = terminalColorLevel(env)
+  return detected === 0 || rendering.colorMode !== 'rgb' ? detected : 3
+}
+
+function rgb(red: number, green: number, blue: number): SemanticColor {
+  return { rgb: [red, green, blue] }
+}
+
+const ANSI_COLORS: readonly SemanticColor[] = [
+  rgb(0, 0, 0), rgb(205, 49, 49), rgb(13, 188, 121), rgb(229, 229, 16),
+  rgb(36, 114, 200), rgb(188, 63, 188), rgb(17, 168, 205), rgb(229, 229, 229),
+  rgb(102, 102, 102), rgb(241, 76, 76), rgb(35, 209, 139), rgb(245, 245, 67),
+  rgb(59, 142, 234), rgb(214, 112, 214), rgb(41, 184, 219), rgb(255, 255, 255),
+]
+
+function xtermColors(): readonly SemanticColor[] {
+  const output = [...ANSI_COLORS]
+  const levels = [0, 95, 135, 175, 215, 255]
+  for (const red of levels) {
+    for (const green of levels) {
+      for (const blue of levels) output.push(rgb(red, green, blue))
+    }
+  }
+  for (let index = 0; index < 24; index += 1) {
+    const channel = 8 + index * 10
+    output.push(rgb(channel, channel, channel))
+  }
+  return output
+}
+
+const XTERM_COLORS = xtermColors()
+
+function nearestColor(entry: SemanticColor, candidates: readonly SemanticColor[]): number {
+  let selected = 0
+  let selectedDistance = Number.POSITIVE_INFINITY
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index]
+    if (candidate === undefined) continue
+    const red = (entry.rgb[0] - candidate.rgb[0]) * 0.3
+    const green = (entry.rgb[1] - candidate.rgb[1]) * 0.59
+    const blue = (entry.rgb[2] - candidate.rgb[2]) * 0.11
+    const distance = red * red + green * green + blue * blue
+    if (distance >= selectedDistance) continue
+    selected = index
+    selectedDistance = distance
+  }
+  return selected
+}
+
+function foregroundSequence(entry: SemanticColor, level: TerminalColorLevel): string {
+  if (level === 1) {
+    const index = nearestColor(entry, ANSI_COLORS)
+    return `\u001B[${String(index < 8 ? 30 + index : 90 + index - 8)}m`
+  }
+  if (level === 2) return `\u001B[38;5;${String(nearestColor(entry, XTERM_COLORS))}m`
+  const [red, green, blue] = entry.rgb
+  return `\u001B[38;2;${String(red)};${String(green)};${String(blue)}m`
+}
+
+function backgroundSequence(entry: SemanticColor, level: TerminalColorLevel): string {
+  if (level === 1) {
+    const index = nearestColor(entry, ANSI_COLORS)
+    return `\u001B[${String(index < 8 ? 40 + index : 100 + index - 8)}m`
+  }
+  if (level === 2) return `\u001B[48;5;${String(nearestColor(entry, XTERM_COLORS))}m`
+  const [red, green, blue] = entry.rgb
+  return `\u001B[48;2;${String(red)};${String(green)};${String(blue)}m`
+}
+
+function paint(entry: SemanticColor, text: string): string {
+  const safeText = escapeTerminalText(text)
+  const level = renderingColorLevel()
+  if (level === 0) return safeText
+  return `${foregroundSequence(entry, level)}${safeText}${RESET}`
+}
+
+function layer(background: SemanticColor | undefined, text: string, foreground = palette.text): string {
+  const level = renderingColorLevel()
+  if (level === 0) return text
+  const prefix = `${background === undefined ? '\u001B[49m' : backgroundSequence(background, level)}${foregroundSequence(foreground, level)}`
+  const restored = text.replace(/\u001B\[(?:0)?m/gu, `${RESET}${prefix}`)
+  return `${prefix}${restored}${RESET}`
+}
+
+function ansi(code: number, text: string): string {
+  const safeText = escapeTerminalText(text)
+  return terminalColorLevel() === 0 ? safeText : `\u001B[${String(code)}m${safeText}${RESET}`
+}
+
+/** Styling request for one syntax token or generated preview fragment. */
+export interface TerminalTextStyle {
+  readonly foreground?: string
+  readonly background?: string
+  readonly bold?: boolean
+  readonly italic?: boolean
+  readonly underline?: boolean
+  readonly strikethrough?: boolean
+}
+
+const tokenStylePrefixes = new Map<string, string>()
+
+/**
+ * Paint untrusted token text using arbitrary theme colors.
+ * @param text - raw token content.
+ * @param style - foreground/background colors and portable code-token styles.
+ * @returns escaped terminal text with capability-aware SGR sequences.
+ */
+export function styleTerminalText(text: string, style: TerminalTextStyle): string {
+  const safeText = escapeTerminalText(text)
+  const level = renderingColorLevel()
+  if (level === 0 || safeText === '') return safeText
+  // Cache only derived SGR bytes, never text; include capability and full style.
+  const flags = (style.bold === true ? 1 : 0) | (style.italic === true ? 2 : 0)
+    | (style.underline === true ? 4 : 0) | (style.strikethrough === true ? 8 : 0)
+  const key = JSON.stringify([level, style.foreground, style.background, flags])
+  const cached = tokenStylePrefixes.get(key)
+  if (cached !== undefined) return cached === '' ? safeText : `${cached}${safeText}${RESET}`
+  const sequences: string[] = []
+  if (style.foreground !== undefined) sequences.push(foregroundSequence(semanticColor(style.foreground), level))
+  if (style.background !== undefined) sequences.push(backgroundSequence(semanticColor(style.background), level))
+  if (style.bold === true) sequences.push('\u001B[1m')
+  if (style.italic === true) sequences.push('\u001B[3m')
+  if (style.underline === true) sequences.push('\u001B[4m')
+  if (style.strikethrough === true) sequences.push('\u001B[9m')
+  const prefix = sequences.join('')
+  tokenStylePrefixes.set(key, prefix)
+  if (tokenStylePrefixes.size > 512) tokenStylePrefixes.delete(tokenStylePrefixes.keys().next().value!)
+  return prefix === '' ? safeText : `${prefix}${safeText}${RESET}`
+}
+
+/**
+ * Switch every dynamic renderer to one complete theme definition.
+ * @param theme - resolved built-in or custom theme.
+ */
+export function setTheme(theme: ResolvedTuiTheme): void {
+  canvasRevision += 1
+  selectedTheme = theme
+  palette = runtimePalette(theme)
+}
+
+/** Return the complete theme currently used by renderers. */
+export function currentTheme(): ResolvedTuiTheme { return selectedTheme }
+
+/** Serializable presentation only; workers never receive Harness state. */
+export interface MarkdownPresentation {
+  theme: ResolvedTuiTheme
+  rendering: TuiRenderingSettings
+  colorLevel: TerminalColorLevel
+}
+let workerColorLevel: TerminalColorLevel | undefined
+export function markdownPresentation(): MarkdownPresentation {
+  return { theme: selectedTheme, rendering: { ...rendering }, colorLevel: terminalColorLevel() }
+}
+export function applyMarkdownPresentation(value: MarkdownPresentation): void {
+  // Worker stdout is not the terminal. Preserve the caller's detected capability.
+  workerColorLevel = value.colorLevel
+  setTheme(value.theme)
+  setRendering(value.rendering)
+}
+
+/** Independent of theme previews/imports; controls which UI surfaces inherit terminal effects. */
+export function setBackgroundMode(mode: TuiBackgroundMode): void { setRendering(resolveRendering({ backgroundMode: mode })) }
+
+/** Encoding and canvas fill are independent of terminal background synchronization. */
+export function setRendering(settings: TuiRenderingSettings): void { canvasRevision += 1; rendering = { ...settings } }
+
+let canvasRevision = 0
+export function canvasStyleRevision(): number { return canvasRevision }
+
+let terminalCanvasBackground: string | undefined
+
+/** Actual background reported by the managed terminal, never persisted as a theme. */
+export function setTerminalCanvasBackground(color?: string): void { canvasRevision += 1; terminalCanvasBackground = color }
+
+/**
+ * Connect the asynchronously prepared syntax highlighter to Markdown rendering.
+ * @param highlighter - synchronous cached renderer, or undefined during teardown.
+ */
+export function setCodeHighlighter(
+  highlighter?: (code: string, lang: string | undefined, background: CodeBackgroundPolicy) => string[],
+  streamFactory?: (lang: string | undefined, background: CodeBackgroundPolicy) => import('./syntax-highlighter.ts').CodeStream,
+): void {
+  canvasRevision += 1
+  codeHighlighter = highlighter
+  codeStreamFactory = streamFactory
+}
+
+export function createCodeStream(language?: string): import('./syntax-highlighter.ts').CodeStream {
+  const codeBackground = rendering.backgroundFill === 'theme' ? 'explicit' : 'inherit'
+  return codeStreamFactory?.(language, codeBackground) ?? {
+    append: code => highlightCodeLines(code, language).slice(0, -1),
+    preview: code => highlightCodeLines(code, language),
+  }
+}
+
+/**
+ * Highlight a code region through the active cached renderer.
+ * @param code - raw code text.
+ * @param language - optional grammar id or alias.
+ * @returns one safely styled entry per source line.
+ */
+export function highlightCodeLines(code: string, language?: string): string[] {
+  const codeBackground = rendering.backgroundFill === 'theme' ? 'explicit' : 'inherit'
+  return codeHighlighter?.(code, language, codeBackground)
+    ?? code.split('\n').map(line => styleTerminalText(line, {
+      foreground: selectedTheme.syntax.foreground,
+      ...(codeBackground === 'explicit' ? { background: selectedTheme.syntax.background } : {}),
+    }))
+}
+
+/** Product semantic foregrounds; no component owns raw color values. */
+export const color = {
+  brand: (text: string): string => paint(palette.brand, text),
+  accent: (text: string): string => paint(palette.accent, text),
+  pulse: (text: string, frame: number): string => {
+    const values = palette.pulse
+    const index = ((Math.floor(frame) % values.length) + values.length) % values.length
+    return paint(values[index] ?? palette.brand, text)
+  },
+  muted: (text: string): string => paint(palette.muted, text),
+  border: (text: string): string => paint(palette.border, text),
+  success: (text: string): string => paint(palette.success, text),
+  warning: (text: string): string => paint(palette.warning, text),
+  danger: (text: string): string => paint(palette.danger, text),
+  /** Fastfetch-compatible `$[1-9]` palette for theme-indexed welcome logos. */
+  logoSlot: (slot: number, text: string): string => paint(([
+    palette.brand,
+    palette.accent,
+    palette.success,
+    palette.warning,
+    palette.danger,
+    palette.text,
+    palette.muted,
+    palette.border,
+    palette.codeForeground,
+  ] as const)[Math.max(0, Math.min(8, Math.floor(slot) - 1))] ?? palette.brand, text),
+  /** One half-block run whose lower pixel may use a second theme slot. */
+  logoCell: (foregroundSlot: number, backgroundSlot: number | undefined, text: string): string => {
+    const slots = [
+      palette.brand,
+      palette.accent,
+      palette.success,
+      palette.warning,
+      palette.danger,
+      palette.text,
+      palette.muted,
+      palette.border,
+      palette.codeForeground,
+    ] as const
+    const foreground = slots[Math.max(0, Math.min(8, Math.floor(foregroundSlot) - 1))] ?? palette.brand
+    const background = backgroundSlot === undefined
+      ? undefined
+      : slots[Math.max(0, Math.min(8, Math.floor(backgroundSlot) - 1))] ?? palette.brand
+    const safeText = escapeTerminalText(text)
+    const level = renderingColorLevel()
+    if (level === 0 || safeText === '') return safeText
+    return `${foregroundSequence(foreground, level)}${background === undefined ? '' : backgroundSequence(background, level)}${safeText}${RESET}`
+  },
+} as const
+
+/** Agent lifecycle foregrounds with independent dark/light contrast. */
+export const statusColor = {
+  running: (text: string): string => paint(palette.statusRunning, text),
+  waiting: (text: string): string => paint(palette.statusWaiting, text),
+  failed: (text: string): string => paint(palette.statusFailed, text),
+} as const
+
+/** Foreground-only interaction states; never introduce a background or text decoration. */
+export const interaction = {
+  hover: (text: string): string => paint(palette.brand, text),
+  /** Paint one control glyph, then restore muted foreground without resetting its surrounding background. */
+  hoverThenMuted: (text: string, remainder: string): string => {
+    const safeText = escapeTerminalText(text)
+    const safeRemainder = escapeTerminalText(remainder)
+    const level = renderingColorLevel()
+    if (level === 0) return `${safeText}${safeRemainder}`
+    return `${foregroundSequence(palette.brand, level)}${safeText}${foregroundSequence(palette.muted, level)}${safeRemainder}`
+  },
+} as const
+
+/** Background layers shared by the full frame, panels, and selected rows. */
+export const background = {
+  canvas: (text: string): string => {
+    const row = layer(rendering.backgroundFill === 'theme' ? palette.canvas : undefined, text)
+    if (terminalColorLevel() === 0 || rendering.backgroundFill === 'theme' || rendering.colorMode === 'rgb'
+      || terminalCanvasBackground?.toLowerCase() === selectedTheme.colors.canvas.toLowerCase()) return row
+    return readableCanvas(row, terminalColorLevel() === 3 ? terminalCanvasBackground : undefined)
+  },
+  surface: (text: string): string => layer(rendering.backgroundFill === 'theme' ? palette.surface : undefined, text),
+  selection: (text: string): string => layer(palette.selection, text),
+  code: (text: string): string => layer(
+    rendering.backgroundFill === 'theme' ? palette.codeBackground : undefined,
+    text,
+    palette.codeForeground,
+  ),
+} as const
+
+/**
+ * Fill a complete panel row with the active surface background.
+ * @param text - trusted, already escaped component output.
+ * @param width - target terminal cells.
+ * @returns one padded surface row.
+ */
+export function surfaceRow(text: string, width: number): string {
+  return background.surface(`${text}${' '.repeat(Math.max(0, width - visibleWidth(text)))}`)
+}
+
+/** Shared editor/select-list theme used by the main composer and overlays. */
+export const editorTheme: EditorTheme = {
+  borderColor: color.brand,
+  selectList: {
+    selectedPrefix: color.brand,
+    selectedText: background.selection,
+    description: color.muted,
+    scrollInfo: color.muted,
+    noMatch: color.warning,
+  },
+}
+
+/** Markdown/GFM theme using semantic colors and a continuous code background. */
+export const markdownTheme: MarkdownTheme = {
+  cacheKey: () => `${canvasRevision}:${terminalColorLevel()}`,
+  heading: color.brand,
+  link: text => ansi(4, color.accent(text)),
+  linkUrl: color.muted,
+  code: text => background.code(color.accent(text)),
+  codeBlock: background.code,
+  codeBlockBorder: color.muted,
+  quote: color.muted,
+  quoteBorder: color.brand,
+  hr: color.muted,
+  listBullet: color.accent,
+  bold: text => ansi(1, text),
+  italic: text => ansi(3, text),
+  strikethrough: text => ansi(9, text),
+  underline: text => ansi(4, text),
+  highlightCode: highlightCodeLines,
+}
