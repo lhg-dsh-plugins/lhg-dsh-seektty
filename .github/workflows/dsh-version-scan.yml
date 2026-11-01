@@ -54,17 +54,21 @@ jobs:
           fi
 
       - name: Bump to the npm latest dsh
+        id: bump
         if: steps.check.outputs.update == 'true' && steps.guard.outputs.exists == 'false'
         run: |
-          node scripts/bump-dsh.mjs "${{ steps.check.outputs.target }}"
-          pnpm install --no-frozen-lockfile
+          # 经 dsh-scan-guard 降噪：待迁移集合无变化时静默 exit 0（proceed=false），
+          # 不再每天为同一已知状态红一次；集合变化时才 exit 2 并更新状态文件。
+          node scripts/dsh-scan-guard.mjs "${{ steps.check.outputs.target }}"
 
       - name: Typecheck, test, build, and pack dry-run
-        if: steps.check.outputs.update == 'true' && steps.guard.outputs.exists == 'false'
-        run: pnpm run check
+        if: steps.check.outputs.update == 'true' && steps.guard.outputs.exists == 'false' && steps.bump.outputs.proceed == 'true'
+        run: |
+          pnpm install --no-frozen-lockfile
+          pnpm run check
 
       - name: Stock dsh add/boot/remove/re-add contract under an isolated DSH_HOME
-        if: steps.check.outputs.update == 'true' && steps.guard.outputs.exists == 'false'
+        if: steps.check.outputs.update == 'true' && steps.guard.outputs.exists == 'false' && steps.bump.outputs.proceed == 'true'
         run: |
           node scripts/install-stock-dsh.mjs "$RUNNER_TEMP/dsh-global"
           TARBALL=$(pnpm pack | tail -1)
@@ -74,7 +78,7 @@ jobs:
           rm -f "$TARBALL"
 
       - name: Open the upgrade pull request
-        if: steps.check.outputs.update == 'true' && steps.guard.outputs.exists == 'false'
+        if: steps.check.outputs.update == 'true' && steps.guard.outputs.exists == 'false' && steps.bump.outputs.proceed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -89,3 +93,24 @@ jobs:
           gh pr create \
             --title "chore(compat): adapt to official dsh $TARGET" \
             --body "$(printf '自动扫描发现官方 dsh 稳定版 %s（npm latest）。\n\n- 全部 @deepseek-ai/dsh-* 依赖与 dsh.compatibility.tested 升级到 %s\n- pnpm run check 通过\n- 隔离 DSH_HOME 下对 stock dsh %s 的 add/boot/remove/re-add 插拔契约通过\n\n合并前请人工确认 README 兼容性描述与 CHANGELOG。' "$TARGET" "$TARGET" "$TARGET")"
+
+      # 降噪状态文件回写：只有待迁移集合发生变化时守卫才会改这个文件；
+      # 此时 bump 步骤是红的（为的是发通知），用 always() 把新状态提交回去，
+      # 下次同样集合就不再红。无变化时直接退出。
+      - name: Commit scan state if changed
+        if: always()
+        run: |
+          if git diff --quiet .dsh-scan-state.json; then echo "No scan state change"; exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add .dsh-scan-state.json
+          git commit -m "chore(scan): 更新 dsh 待迁移集合状态"
+          for i in 1 2 3; do
+            if git fetch origin "${{ github.ref_name }}" && git merge --no-edit "origin/${{ github.ref_name }}" && git push origin "HEAD:${{ github.ref_name }}"; then
+              exit 0
+            fi
+            git merge --abort 2>/dev/null || true
+            sleep 10
+          done
+          echo "::error::scan state 推不上去，已重试 3 次。"
+          exit 1
