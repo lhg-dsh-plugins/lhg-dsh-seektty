@@ -1,0 +1,8 @@
+{
+  "target": "0.2.1-rc.5",
+  "missing": [
+    "@deepseek-ai/dsh-experimental-schedule-bundle",
+    "@deepseek-ai/dsh-invariants",
+    "@deepseek-ai/dsh-subagent-in-process-driver"
+  ]
+}
