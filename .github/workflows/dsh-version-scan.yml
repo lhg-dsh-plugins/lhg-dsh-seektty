@@ -100,17 +100,21 @@ jobs:
       - name: Commit scan state if changed
         if: always()
         run: |
-          if git diff --quiet .dsh-scan-state.json; then echo "No scan state change"; exit 0; fi
+          # 降噪状态文件回写：只有待迁移集合发生变化时守卫才会改这个文件；
+          # 此时 bump 步骤是红的（为的是发通知），用 always() 把新状态提交回去，
+          # 下次同样集合就不再红。无变化时直接退出。
+          # 此步骤为 best-effort：提交失败只告警，永不让 workflow 变红。
+          if git diff --quiet -- .dsh-scan-state.json; then
+            echo "No scan state change"
+            exit 0
+          fi
+          echo "Detected state file change, will try to commit back:"
+          git diff -- .dsh-scan-state.json | head -30
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git add .dsh-scan-state.json
-          git commit -m "chore(scan): 更新 dsh 待迁移集合状态"
-          for i in 1 2 3; do
-            if git fetch origin "${{ github.ref_name }}" && git merge --no-edit "origin/${{ github.ref_name }}" && git push origin "HEAD:${{ github.ref_name }}"; then
-              exit 0
-            fi
-            git merge --abort 2>/dev/null || true
-            sleep 10
-          done
-          echo "::error::scan state 推不上去，已重试 3 次。"
-          exit 1
+          git commit -m "chore(scan): 更新 dsh 待迁移集合状态" || { echo "::warning::nothing to commit"; exit 0; }
+          git fetch origin "${{ github.ref_name }}" || { echo "::warning::fetch failed"; exit 0; }
+          git rebase "origin/${{ github.ref_name }}" || { echo "::warning::rebase failed"; exit 0; }
+          git push origin "HEAD:${{ github.ref_name }}" || echo "::warning::push failed, will retry next run"
+          exit 0
