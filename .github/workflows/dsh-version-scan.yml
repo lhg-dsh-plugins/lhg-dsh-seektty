@@ -29,7 +29,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22.x
-          cache: 'pnpm'
 
       - name: Check the npm latest dsh against the tested baseline
         id: check
