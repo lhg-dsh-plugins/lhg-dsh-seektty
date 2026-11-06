@@ -1,5 +1,5 @@
 {
-  "target": "0.2.1-rc.5",
+  "target": "0.2.2-rc.1",
   "missing": [
     "@deepseek-ai/dsh-experimental-schedule-bundle",
     "@deepseek-ai/dsh-invariants",
